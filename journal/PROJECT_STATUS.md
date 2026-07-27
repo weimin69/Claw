@@ -14,6 +14,8 @@
 
 当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理模型。当前已经完成 `run()` / `main()` 职责拆分，将命令错误模型从 `Result<(), String>` 迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令完成了文件读取、TOML 解析和错误上下文练习。项目已经开始进入简单配置读取与解析阶段，当前 `read-config` 可以将 TOML 文件解析为 `Config` 结构体并输出字段，`main()` 也已经可以打印 `anyhow` 错误链。
 
+最近一次学习中，`main()` 的错误链输出已调整为分组编号格式，`Config.temperature` 已从必填 `f64` 改为可选 `Option<f64>`，并通过 `match` 明确处理 `Some` 和 `None`。当前重点转向配置字段设计：哪些字段应该必填，哪些字段可以缺失，缺失时是输出 `not set` 还是使用默认值。
+
 ## Completed
 
 - 创建 Cargo Rust 项目
@@ -97,10 +99,18 @@
 - 使用 `error.chain().skip(1)` 打印底层错误原因
 - 验证 `cargo fmt --check` 通过
 - 验证 `cargo check` 通过
+- 将错误链输出调整为 `caused by:` 分组加编号的格式
+- 初步理解 `collect()` 将 iterator 收集为 `Vec`
+- 初步理解 `enumerate()` 为迭代器元素生成编号
+- 初步理解 `Vec` 不能直接用 `{}` 打印，因为它没有实现 `Display`
+- 初步理解 `Option<T>` 用于表达值可能存在或不存在
+- 将 `Config.temperature` 从 `f64` 改为 `Option<f64>`
+- 使用 `match` 处理 `Some(temperature)` 和 `None`
+- 验证缺少 `temperature` 时 `read-config` 输出 `temperature: not set`
 
 ## In Progress
 
-继续围绕配置读取、配置解析和错误输出边界推进：
+继续围绕配置读取、配置解析、错误输出边界和配置字段设计推进：
 
 - `serde::Deserialize`
 - `toml::from_str()`
@@ -109,18 +119,19 @@
 - `anyhow::Error::chain()`
 - 配置结构体字段设计
 - 用户输出和调试输出的边界
+- `Option<T>` 表达可选配置字段
 
-当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`、遍历错误链打印 `caused by: ...`，并返回失败退出码。`read-config` 已能接收路径参数、读取 TOML 文件、解析为 `Config`，并输出 `model` 与 `temperature` 字段。
+当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数、读取 TOML 文件、解析为 `Config`，并输出 `model` 与 `temperature` 字段；其中 `temperature` 当前是可选字段，缺失时输出 `temperature: not set`。
 
 ## Next Step
 
-下一步建议继续配置错误输出边界练习：
+下一步建议继续配置字段设计练习：
 
-- 使用不同坏配置继续观察错误链输出
-- 对比文件读取错误、TOML 语法错误、缺少字段和字段类型错误
-- 思考哪些底层错误细节适合直接暴露给 CLI 用户
-- 考虑是否需要调整错误输出格式，让多层原因更易读
-- 完成错误输出理解后，再进入配置结构体字段设计或配置模块拆分讨论
+- 清理 `read_config.rs` 中旧的 `println!` 注释
+- 讨论 `temperature` 缺失时是否应该继续输出 `not set`
+- 对比 `Option<f64>`、`unwrap_or(default)` 和 `#[serde(default)]` 的适用边界
+- 决定哪些配置字段应必填，哪些字段可以有默认值
+- 完成配置字段设计理解后，再考虑是否拆分 `Config` 到独立配置模块
 
 完成这些理解后，再进入：
 
@@ -155,6 +166,7 @@ src
 - `src/commands/mod.rs`：统一导出命令模块
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；`main()` 负责调用 `run()`、统一打印错误、打印错误链和设置失败退出码
 - `read-config` 当前用于配置读取和解析练习，负责读取指定路径的 TOML 文件，解析为 `Config`，并输出配置字段
+- `Config.temperature` 当前使用 `Option<f64>` 表达可选字段，缺失时由 `match` 分支输出 `temperature: not set`
 
 新增命令时应遵循：
 
@@ -167,7 +179,8 @@ src
 ## Open Questions
 
 - TOML 解析失败时，错误信息应该暴露多少底层细节？
-- 错误链输出是否需要更清晰的层级格式？
+- `temperature` 缺失时应该输出 `not set`，还是使用默认值？
+- 默认值应该在输出层处理，还是通过 serde 配置模型处理？
 - `Config` 后续是否应该移动到单独的配置模块？
 - 后续命令越来越多时，是否需要改进 `main.rs` 中的分发方式？
 - 后续是否需要为命令执行结果和错误输出增加自动化测试？
@@ -176,11 +189,13 @@ src
 
 - 当前命令没有测试
 - `Config` 当前还定义在 `read_config.rs` 中，后续配置逻辑变复杂时可能需要拆分模块
+- `read_config.rs` 中仍保留一行旧的 `println!("temperature: {}", config.temperature);` 注释，后续应清理
+- 项目根目录存在临时测试配置文件 `missing.toml`，后续应决定保留、迁移为示例配置或删除
 - 当前日志文件命名存在 `2026-7-13.md`、`2026-7-14.md`，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 
 ## Next TODO
 
-- [ ] 用不同坏配置继续观察 `error:` 和 `caused by:` 输出
-- [ ] 对比文件读取错误、TOML 语法错误、缺少字段和字段类型错误
-- [ ] 思考是否需要调整错误链输出格式
+- [ ] 清理 `read_config.rs` 中旧的 `println!` 注释
+- [ ] 讨论 `temperature` 缺失时使用 `not set` 还是默认值
+- [ ] 对比 `Option<f64>`、`unwrap_or(default)` 和 `#[serde(default)]`

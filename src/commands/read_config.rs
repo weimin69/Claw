@@ -7,12 +7,20 @@ pub fn execute(path: &str) -> Result<()> {
     let config: Config = toml::from_str(&content).context("failed to parse config file")?;
 
     println!("model: {}", config.model);
-    println!("temperature: {}", config.temperature);
+    match config.temperature {
+        Some(temperature) => {
+            println!("temperature: {}", temperature);
+        }
+        None => {
+            println!("temperature: not set");
+        }
+    }
+
 
     Ok(())
 }
 #[derive(Debug, Deserialize)]
 struct Config {
     model: String,
-    temperature: f64,
+    temperature: Option<f64>,
 }

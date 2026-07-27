@@ -8,8 +8,14 @@ use clap::Parser;
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {}", error);
-        for cause in error.chain().skip(1) {
-            eprintln!("caused by: {}", cause);
+        let causes: Vec<_> = error.chain().skip(1).collect();
+        if !causes.is_empty() {
+            eprintln!();
+            eprintln!("caused by:");
+        }
+
+        for (index, cause) in causes.iter().enumerate() {
+            eprintln!("     {}. {}", index + 1, cause);
         }
         std::process::exit(1);
     }
