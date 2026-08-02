@@ -12,9 +12,9 @@
 - 命令分发
 - 后续 Agent 能力所需的配置、错误处理、异步请求与 API 调用
 
-当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理和配置处理模型。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
+当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型和模块边界。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
 
-最近一次学习中，`Config.model` 和 `Config.temperature` 都从“必须由用户明确配置或手动处理缺失”调整为通过 `#[serde(default = "...")]` 提供默认值；`read-config` 新增了 `Config::validate()`，用于校验模型白名单和 `temperature` 范围。当前重点已经从字段缺失处理推进到配置业务校验和配置代码组织边界。
+最近一次学习中，配置相关逻辑已经从 `src/commands/read_config.rs` 拆分到 `src/config.rs`。`Config`、默认值函数、支持模型列表、`Config::validate()` 和 `load_config(path)` 现在属于配置模块；`read-config` 命令只负责调用配置模块并打印结果。当前重点已经从配置业务校验推进到模块边界和后续测试准备。
 
 ## Completed
 
@@ -126,10 +126,22 @@
 - 验证合法配置、非法模型、非法 `temperature` 的行为
 - 验证 `cargo fmt --check` 通过
 - 验证 `cargo check` 通过
+- 复习配置处理四步：读取文件、解析 TOML、应用默认值、业务校验
+- 讨论命令模块和通用配置模块的职责边界
+- 初步理解 Rust 模块可见性 `pub`
+- 新增 `src/config.rs`
+- 将 `Config`、默认值函数、`SUPPORTED_MODELS` 和 `Config::validate()` 移动到配置模块
+- 新增 `config::load_config(path) -> anyhow::Result<Config>`
+- 在 `src/main.rs` 中注册 `mod config;`
+- 将 `read-config` 命令简化为调用 `crate::config::load_config(path)` 并打印结果
+- 理解多个命令应该共享底层能力，而不是互相调用 `execute()`
+- 验证拆分后 `cargo fmt --check` 通过
+- 验证拆分后 `cargo check` 通过
+- 验证 `cargo run -- read-config Cargo.toml` 行为正常
 
 ## In Progress
 
-继续围绕配置读取、配置解析、错误输出边界、配置字段设计和配置业务校验推进：
+继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验和模块边界推进：
 
 - `serde::Deserialize`
 - `toml::from_str()`
@@ -141,18 +153,20 @@
 - 默认值的放置边界
 - 配置业务校验
 - 用户输出和调试输出的边界
+- 模块可见性 `pub`
+- 命令层和配置模块的职责边界
 
-当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数、读取 TOML 文件、解析为 `Config`、应用默认值、执行业务校验，并输出 `model` 与 `temperature` 字段。
+当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数，并通过 `config::load_config(path)` 读取 TOML 文件、解析为 `Config`、应用默认值、执行业务校验，然后输出 `model` 与 `temperature` 字段。
 
 ## Next Step
 
-下一步建议继续做配置代码组织和小范围整理：
+下一步建议为配置模块增加基础测试：
 
-- 整理 `read_config.rs` 的小风格问题，例如 import 顺序和 `const` 前空行
-- 复习配置处理四步：读取文件、解析 TOML、应用默认值、业务校验
-- 讨论 `Config` 是否应该继续留在 `read_config.rs`，还是拆分到独立配置模块
-- 思考 `read-config` 是调试命令，还是未来真实 Agent 配置加载逻辑的一部分
-- 在进入 `reqwest` / `async` 前，确认配置读取和校验流程边界稳定
+- 测试缺少 `model` 和 `temperature` 时会应用默认值
+- 测试非法 `model` 会返回业务错误
+- 测试非法 `temperature` 会返回业务错误
+- 测试 TOML 语法错误或字段类型错误会带有解析上下文
+- 继续确认 `read-config` 是调试命令，真实配置加载能力由 `config::load_config()` 提供
 
 完成这些理解后，再进入：
 
@@ -177,6 +191,7 @@ src
 │   ├── version.rs
 │   └── mod.rs
 ├── cli.rs
+├── config.rs
 └── main.rs
 ```
 
@@ -185,12 +200,14 @@ src
 - `src/cli.rs`：定义 CLI 结构和子命令，不写业务逻辑
 - `src/commands/`：每个命令一个文件，负责具体业务逻辑，并通过 `anyhow::Result<()>` 返回执行结果
 - `src/commands/mod.rs`：统一导出命令模块
+- `src/config.rs`：定义配置模型、默认值、支持模型列表、业务校验和 `load_config(path)`
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；`main()` 负责调用 `run()`、统一打印错误、打印错误链和设置失败退出码
-- `read-config` 当前用于配置读取和解析练习，负责读取指定路径的 TOML 文件，解析为 `Config`，应用默认值，执行业务校验，并输出配置字段
+- `read-config` 当前用于配置读取和解析练习，负责调用 `config::load_config(path)` 并输出配置字段
 - `Config.model` 当前通过 `#[serde(default = "default_model")]` 缺失时默认使用 `gpt-4.1`
 - `Config.temperature` 当前通过 `#[serde(default = "default_temperature")]` 缺失时默认使用 `0.7`
 - `Config::validate()` 当前校验模型支持列表和 `temperature` 范围
 - `SUPPORTED_MODELS` 当前定义了允许的模型列表：`gpt-4.1`、`gpt-4.1-mini`
+- `Config` 和需要跨模块读取的字段当前使用 `pub` 暴露给命令层
 
 新增命令时应遵循：
 
@@ -203,18 +220,16 @@ src
 ## Open Questions
 
 - TOML 解析失败时，错误信息应该暴露多少底层细节？
-- 默认值应该长期写在当前命令模块中，还是移动到独立配置模块？
 - `read-config` 是调试命令，还是未来真实 Agent 配置加载流程的一部分？
-- `Config` 后续是否应该移动到单独的配置模块？
 - 支持模型列表后续应该硬编码、放入配置，还是由 API 能力发现？
 - 后续命令越来越多时，是否需要改进 `main.rs` 中的分发方式？
 - 后续是否需要为命令执行结果和错误输出增加自动化测试？
+- `Config` 字段长期保持 `pub`，还是后续改为访问器方法？
 
 ## Technical Debt
 
 - 当前命令没有测试
-- `Config` 当前还定义在 `read_config.rs` 中，后续配置逻辑变复杂时可能需要拆分模块
-- `read_config.rs` 中 import 顺序和 `const` 前空行可以进一步整理
+- `config::load_config()` 当前还没有测试
 - 项目根目录存在 `config.toml`，需要决定它是示例配置、测试配置，还是临时文件
 - 当前项目根目录没有 `PROJECT_STATUS.md`，实际状态文件位于 `journal/PROJECT_STATUS.md`
 - 当前日志文件命名存在 `2026-7-13.md`、`2026-7-14.md`，后续建议统一为 `YYYY-MM-DD.md`
@@ -222,6 +237,6 @@ src
 
 ## Next TODO
 
-- [ ] 整理 `read_config.rs` 的 import 顺序和空行
-- [ ] 复习 `Option<T>`、普通字段、`#[serde(default)]` 的设计边界
-- [ ] 讨论是否将 `Config`、默认值函数和 `SUPPORTED_MODELS` 拆分到独立配置模块
+- [ ] 为 `config::load_config()` 编写基础测试
+- [ ] 测试配置默认值、非法模型、非法 temperature 和坏 TOML
+- [ ] 在配置测试稳定后，准备进入 `reqwest` 和 async Rust
