@@ -12,9 +12,9 @@
 - 命令分发
 - 后续 Agent 能力所需的配置、错误处理、异步请求与 API 调用
 
-当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型和模块边界。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
+当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型、模块边界和基础测试。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
 
-最近一次学习中，配置相关逻辑已经从 `src/commands/read_config.rs` 拆分到 `src/config.rs`。`Config`、默认值函数、支持模型列表、`Config::validate()` 和 `load_config(path)` 现在属于配置模块；`read-config` 命令只负责调用配置模块并打印结果。当前重点已经从配置业务校验推进到模块边界和后续测试准备。
+最近一次学习中，配置模块已经开始补充单元测试。当前已测试配置默认值、非法模型、非法 `temperature` 和 TOML 字段类型错误；`cargo test` 当前 4 个测试全部通过。下一步重点是继续测试 `config::load_config(path)` 的文件读取、解析上下文和完整配置加载流程。
 
 ## Completed
 
@@ -138,14 +138,25 @@
 - 验证拆分后 `cargo fmt --check` 通过
 - 验证拆分后 `cargo check` 通过
 - 验证 `cargo run -- read-config Cargo.toml` 行为正常
+- 初步理解 Rust 单元测试结构：`#[cfg(test)]`、`mod tests`、`#[test]` 和 `use super::*`
+- 为 `Config` 默认值行为添加单元测试
+- 为非法 `model` 添加业务校验测试
+- 为非法 `temperature` 添加业务校验测试
+- 为 `temperature` 字段类型错误添加 TOML 解析失败测试
+- 初步理解测试应按错误发生层次编写：解析错误测反序列化，业务错误测 `validate()`
+- 验证 `cargo test` 通过，当前 4 个测试全部通过
 
 ## In Progress
 
-继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验和模块边界推进：
+继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验、模块边界和基础测试推进：
 
 - `serde::Deserialize`
 - `toml::from_str()`
 - `#[serde(default = "...")]`
+- `#[cfg(test)]`
+- `#[test]`
+- `assert_eq!`
+- `assert!`
 - 配置文件格式错误
 - 解析错误上下文
 - `anyhow::Error::chain()`
@@ -155,16 +166,19 @@
 - 用户输出和调试输出的边界
 - 模块可见性 `pub`
 - 命令层和配置模块的职责边界
+- 配置模块单元测试的覆盖边界
 
-当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数，并通过 `config::load_config(path)` 读取 TOML 文件、解析为 `Config`、应用默认值、执行业务校验，然后输出 `model` 与 `temperature` 字段。
+当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数，并通过 `config::load_config(path)` 读取 TOML 文件、解析为 `Config`、应用默认值、执行业务校验，然后输出 `model` 与 `temperature` 字段。`src/config.rs` 当前已有 4 个单元测试，覆盖默认值、业务校验失败和字段类型解析失败。
 
 ## Next Step
 
-下一步建议为配置模块增加基础测试：
+下一步建议继续完善配置模块测试：
 
-- 测试缺少 `model` 和 `temperature` 时会应用默认值
-- 测试非法 `model` 会返回业务错误
-- 测试非法 `temperature` 会返回业务错误
+- 修正测试数据中的 `unknown-model` 拼写
+- 为 `config::load_config(path)` 编写基础测试
+- 测试真实文件中缺少 `model` 和 `temperature` 时会应用默认值
+- 测试 `load_config()` 遇到非法 `model` 会返回业务错误
+- 测试 `load_config()` 遇到非法 `temperature` 会返回业务错误
 - 测试 TOML 语法错误或字段类型错误会带有解析上下文
 - 继续确认 `read-config` 是调试命令，真实配置加载能力由 `config::load_config()` 提供
 
@@ -208,6 +222,7 @@ src
 - `Config::validate()` 当前校验模型支持列表和 `temperature` 范围
 - `SUPPORTED_MODELS` 当前定义了允许的模型列表：`gpt-4.1`、`gpt-4.1-mini`
 - `Config` 和需要跨模块读取的字段当前使用 `pub` 暴露给命令层
+- `src/config.rs` 当前包含单元测试模块，测试配置默认值、业务校验失败和 TOML 字段类型错误
 
 新增命令时应遵循：
 
@@ -225,11 +240,13 @@ src
 - 后续命令越来越多时，是否需要改进 `main.rs` 中的分发方式？
 - 后续是否需要为命令执行结果和错误输出增加自动化测试？
 - `Config` 字段长期保持 `pub`，还是后续改为访问器方法？
+- `load_config()` 测试是否使用临时文件，还是先用简单测试辅助函数？
 
 ## Technical Debt
 
 - 当前命令没有测试
-- `config::load_config()` 当前还没有测试
+- `config::load_config()` 当前还没有直接测试
+- `rejects_unsupported_model` 测试数据中存在 `unkown-model` 拼写问题，后续应修正为 `unknown-model`
 - 项目根目录存在 `config.toml`，需要决定它是示例配置、测试配置，还是临时文件
 - 当前项目根目录没有 `PROJECT_STATUS.md`，实际状态文件位于 `journal/PROJECT_STATUS.md`
 - 当前日志文件命名存在 `2026-7-13.md`、`2026-7-14.md`，后续建议统一为 `YYYY-MM-DD.md`
@@ -237,6 +254,7 @@ src
 
 ## Next TODO
 
+- [ ] 修正测试数据中的 `unknown-model` 拼写
 - [ ] 为 `config::load_config()` 编写基础测试
-- [ ] 测试配置默认值、非法模型、非法 temperature 和坏 TOML
+- [ ] 测试 `load_config()` 的默认值、非法模型、非法 temperature 和坏 TOML
 - [ ] 在配置测试稳定后，准备进入 `reqwest` 和 async Rust

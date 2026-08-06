@@ -48,3 +48,47 @@ impl Config {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applies_default_values_when_fields_are_missing() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(config.model, "gpt-4.1");
+        assert_eq!(config.temperature, 0.7);
+    }
+
+    #[test]
+    fn rejects_unsupported_model() {
+        let config = Config {
+            model: "unknown-model".to_string(),
+            temperature: 0.7,
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_temperature_out_of_range() {
+        let config = Config {
+            model: "gpt-4.1".to_string(),
+            temperature: 3.0,
+        };
+
+        let result = config.validate();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_temperature_type() {
+        let result = toml::from_str::<Config>(r#"temperature ="hot""#,
+        );
+
+        assert!(result.is_err());
+    }
+}
