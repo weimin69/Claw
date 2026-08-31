@@ -6,8 +6,9 @@ use crate::cli::{Cli, Commands};
 use anyhow::Result;
 use clap::Parser;
 
-fn main() {
-    if let Err(error) = run() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = run().await {
         eprintln!("error: {}", error);
         let causes: Vec<_> = error.chain().skip(1).collect();
         if !causes.is_empty() {
@@ -22,7 +23,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<()> {
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Hello { name, age } => {
@@ -45,6 +46,9 @@ fn run() -> Result<()> {
         }
         Commands::ReadConfig { path } => {
             commands::read_config::execute(&path)?;
+        }
+        Commands::Wait { seconds } => {
+            commands::wait::execute(seconds).await?;
         }
     }
     Ok(())

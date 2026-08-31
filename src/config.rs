@@ -94,9 +94,8 @@ mod tests {
     #[test]
     fn loads_config_from_file() {
         let file = write_temp_config(
-            r#"
-      model = "gpt-4.1-mini"
-      temperature = 1.0
+            r#"model = "gpt-4.1-mini"
+               temperature = 1.0
       "#,
         );
 
@@ -105,6 +104,7 @@ mod tests {
         assert_eq!(config.model, "gpt-4.1-mini");
         assert_eq!(config.temperature, 1.0);
     }
+
     #[test]
     fn load_config_applies_default_values_when_fields_are_missing() {
         let file = write_temp_config("");
@@ -118,9 +118,8 @@ mod tests {
     #[test]
     fn load_config_rejects_unsupported_model() {
         let file = write_temp_config(
-            r#"
-      model = "unknown-model"
-      temperature = 0.7
+            r#"model = "unknown-model"
+               temperature = 0.7
       "#,
         );
 
@@ -132,9 +131,8 @@ mod tests {
     #[test]
     fn load_config_rejects_temperature_out_of_range() {
         let file = write_temp_config(
-            r#"
-      model = "gpt-4.1"
-      temperature = 3.0
+            r#"model = "gpt-4.1"
+            temperature = 3.0
       "#,
         );
 

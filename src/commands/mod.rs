@@ -5,3 +5,4 @@ pub mod read_config;
 pub mod repeat;
 pub mod sum;
 pub mod version;
+pub mod wait;

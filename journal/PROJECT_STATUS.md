@@ -12,9 +12,9 @@
 - 命令分发
 - 后续 Agent 能力所需的配置、错误处理、异步请求与 API 调用
 
-当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型、模块边界和基础测试。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
+当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型、模块边界、基础测试和异步执行入口。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
 
-最近一次学习中，配置模块测试已经继续推进。当前已测试配置默认值、非法模型、非法 `temperature`、TOML 字段类型错误，以及 `config::load_config(path)` 的文件读取、默认值、业务校验和错误上下文；`cargo test` 当前 10 个测试全部通过。下一步重点是确认开发者能解释这些测试的分层设计，然后准备进入 `reqwest` 和 async Rust。
+最近一次学习中，配置模块测试分层已经完成轻量复习，并开始进入 async Rust。项目添加了 `tokio`，将 `main()` 接入 `#[tokio::main]`，将 `run()` 改为 `async fn`，并新增 `wait <seconds>` 命令练习 `tokio::time::sleep(...).await`。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，`wait 1` 正常运行，`wait 0` 能返回业务错误。
 
 ## Completed
 
@@ -153,10 +153,22 @@
 - 测试 `load_config()` 遇到 TOML 解析失败时包含解析上下文
 - 测试 `load_config()` 遇到文件读取失败时包含路径上下文
 - 验证 `cargo test` 通过，当前 10 个测试全部通过
+- 复习配置模块测试分层：文件系统层、TOML 解析层、serde 默认值层、业务校验层
+- 初步理解 async Rust 的项目动机：HTTP 请求、流式响应、工具执行和超时控制都可能等待外部资源
+- 添加 `tokio` 依赖，并启用 `macros`、`rt-multi-thread` 和 `time` features
+- 将 `main()` 改为 `#[tokio::main] async fn main()`
+- 将 `run()` 改为 `async fn run() -> anyhow::Result<()>`
+- 初步理解 async 函数调用返回 `Future`
+- 初步理解 `.await` 等待 `Future` 完成，`?` 处理完成后的 `Result`
+- 实现 `wait <seconds>` 命令
+- 在 `wait::execute(seconds)` 中使用 `tokio::time::sleep(std::time::Duration::from_secs(seconds)).await`
+- 为 `wait` 命令设计业务校验：`seconds` 必须在 `1..=60`
+- 验证 `cargo run -- wait 1` 正常路径
+- 验证 `cargo run -- wait 0` 业务错误路径
 
 ## In Progress
 
-继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验、模块边界和基础测试推进：
+继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验、模块边界、基础测试和 async Rust 入门推进：
 
 - `serde::Deserialize`
 - `toml::from_str()`
@@ -178,24 +190,31 @@
 - 模块可见性 `pub`
 - 命令层和配置模块的职责边界
 - 配置模块单元测试的覆盖边界
+- `tokio`
+- `#[tokio::main]`
+- `async fn`
+- `Future`
+- `.await`
+- `tokio::time::sleep`
+- 同步命令和异步命令在同一个 CLI 中共存
 
-当前所有命令的 `execute()` 已统一返回 `anyhow::Result<()>`。`run()` 负责解析 CLI、匹配子命令并使用 `?` 转发业务错误；`main()` 负责统一打印 `error: ...`，并在存在底层错误时以 `caused by:` 分组编号格式打印错误链，然后返回失败退出码。`read-config` 已能接收路径参数，并通过 `config::load_config(path)` 读取 TOML 文件、解析为 `Config`、应用默认值、执行业务校验，然后输出 `model` 与 `temperature` 字段。`src/config.rs` 当前已有 10 个单元测试，覆盖默认值、业务校验失败、TOML 字段类型错误、真实文件加载和错误上下文。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)` 是第一个异步命令，返回 `anyhow::Result<()>` 并通过 async 函数提供 `Future`。`run()` 当前负责解析 CLI、匹配子命令、调用同步命令或在 `Wait` 分支中 `.await` 异步命令，并使用 `?` 转发业务错误；`main()` 通过 Tokio runtime 驱动 `run().await`，统一打印 `error: ...` 和错误链，然后返回失败退出码。
 
 ## Next Step
 
-下一步建议先做一次轻量复习，确认配置模块测试目标是否真正掌握：
+下一步建议先复习 async 调用链，确认第一个异步命令不是只停留在“能运行”：
 
-- 解释 `load_config()` 的完整控制流：读取文件、解析 TOML、应用默认值、业务校验、返回配置
-- 解释为什么测试使用 `tempfile`，而不是项目根目录里的固定配置文件
-- 解释 dev-dependencies 与普通 dependencies 的区别
-- 解释哪些错误属于解析层，哪些错误属于业务校验层，哪些错误属于文件系统层
-- 检查测试辅助函数和测试数据缩进是否需要小幅整理
-- 继续确认 `read-config` 是调试命令，真实配置加载能力由 `config::load_config()` 提供
+- 解释 `cargo run -- wait 1` 从 `main()` 到程序退出的完整控制流
+- 解释 `#[tokio::main]` 在哪里启动 runtime
+- 解释 `run().await` 和 `commands::wait::execute(seconds).await?` 的执行顺序
+- 区分 `.await` 和 `?` 的职责
+- 解释为什么 `hello`、`sum`、`read-config` 暂时不需要改成 `async fn`
+- 清理 `Cargo.toml` 多余空行和 `src/config.rs` 中剩余 raw string TOML 缩进
 
 完成这些理解后，再进入：
 
 - `reqwest`
-- `async`
+- HTTP 请求基础
 - OpenAI API
 - Agent loop
 
@@ -212,6 +231,7 @@ src
 │   ├── read_config.rs
 │   ├── repeat.rs
 │   ├── sum.rs
+│   ├── wait.rs
 │   ├── version.rs
 │   └── mod.rs
 ├── cli.rs
@@ -222,10 +242,10 @@ src
 当前职责划分：
 
 - `src/cli.rs`：定义 CLI 结构和子命令，不写业务逻辑
-- `src/commands/`：每个命令一个文件，负责具体业务逻辑，并通过 `anyhow::Result<()>` 返回执行结果
+- `src/commands/`：每个命令一个文件，负责具体业务逻辑；多数同步命令通过 `anyhow::Result<()>` 返回执行结果，`wait` 是当前第一个 async 命令
 - `src/commands/mod.rs`：统一导出命令模块
 - `src/config.rs`：定义配置模型、默认值、支持模型列表、业务校验和 `load_config(path)`
-- `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；`main()` 负责调用 `run()`、统一打印错误、打印错误链和设置失败退出码
+- `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；`main()` 使用 `#[tokio::main]` 启动 runtime，调用 `run().await`，统一打印错误、打印错误链和设置失败退出码
 - `read-config` 当前用于配置读取和解析练习，负责调用 `config::load_config(path)` 并输出配置字段
 - `Config.model` 当前通过 `#[serde(default = "default_model")]` 缺失时默认使用 `gpt-4.1`
 - `Config.temperature` 当前通过 `#[serde(default = "default_temperature")]` 缺失时默认使用 `0.7`
@@ -234,6 +254,8 @@ src
 - `Config` 和需要跨模块读取的字段当前使用 `pub` 暴露给命令层
 - `src/config.rs` 当前包含单元测试模块，测试配置默认值、业务校验失败、TOML 字段类型错误、真实文件加载和错误上下文
 - `tempfile` 当前只作为 dev-dependency，用于配置模块测试
+- `wait <seconds>` 当前用于 async 入门练习，业务规则为 `seconds` 必须在 `1..=60`
+- `tokio` 当前作为普通 dependency，用于 runtime、宏和定时器能力
 
 新增命令时应遵循：
 
@@ -241,7 +263,7 @@ src
 2. 在 `src/commands/` 下新增命令模块
 3. 在 `src/commands/mod.rs` 中导出模块
 4. 在 `src/main.rs` 中添加命令分发
-5. 在命令模块中提供返回 `anyhow::Result<()>` 的 `execute()` 函数
+5. 在命令模块中提供返回 `anyhow::Result<()>` 的 `execute()` 函数；如果命令需要 `.await`，则将该命令的 `execute()` 设计为 `async fn`
 
 ## Open Questions
 
@@ -252,6 +274,8 @@ src
 - 后续是否需要为命令执行结果和错误输出增加自动化测试？
 - `Config` 字段长期保持 `pub`，还是后续改为访问器方法？
 - 当前配置模块测试是否已经足够支撑进入 async 和 HTTP 客户端学习？
+- `wait` 命令是否需要 CLI 行为测试，还是暂时作为手动验证的 async 练习命令？
+- `run()` 变成 async 后，后续是否应该保持同步命令原样，还是逐步统一命令接口？
 
 ## Technical Debt
 
@@ -261,11 +285,13 @@ src
 - 当前日志文件命名存在 `2026-7-13.md`、`2026-7-14.md`，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - 配置测试数据缩进可以继续整理，提高可读性
+- `Cargo.toml` 中 `tokio` 依赖附近有多余空行，可下次顺手清理
+- `src/config.rs` 中部分 raw string TOML 测试数据仍有缩进残留，可下次继续整理
 
 ## Next TODO
 
-- [ ] 解释 `load_config()` 的完整控制流
-- [ ] 解释为什么测试使用 `tempfile` 而不是固定配置文件
-- [ ] 复习 `dev-dependencies` 和普通 dependencies 的区别
-- [ ] 判断配置模块测试学习目标是否已经掌握
-- [ ] 在确认理解后，准备进入 `reqwest` 和 async Rust
+- [ ] 解释 `cargo run -- wait 1` 的完整 async 控制流
+- [ ] 区分 `.await` 和 `?` 的职责
+- [ ] 清理 `Cargo.toml` 多余空行
+- [ ] 继续整理 `src/config.rs` 中 raw string TOML 测试数据缩进
+- [ ] 准备学习 `reqwest` 的基本请求模型

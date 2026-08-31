@@ -37,4 +37,7 @@ pub enum Commands {
     ReadConfig {
         path: String,
     },
+    Wait {
+        seconds: u64,
+    },
 }
