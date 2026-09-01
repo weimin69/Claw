@@ -1,5 +1,6 @@
 pub mod divide;
 pub mod echo;
+pub mod fetch;
 pub mod hello;
 pub mod read_config;
 pub mod repeat;

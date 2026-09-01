@@ -50,6 +50,9 @@ async fn run() -> Result<()> {
         Commands::Wait { seconds } => {
             commands::wait::execute(seconds).await?;
         }
+        Commands::Fetch { url } => {
+            commands::fetch::execute(&url).await?;
+        }
     }
     Ok(())
 }

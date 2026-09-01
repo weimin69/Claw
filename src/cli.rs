@@ -40,4 +40,7 @@ pub enum Commands {
     Wait {
         seconds: u64,
     },
+    Fetch {
+        url: String,
+    },
 }

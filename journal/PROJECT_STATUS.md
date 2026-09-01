@@ -14,7 +14,7 @@
 
 当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型、模块边界、基础测试和异步执行入口。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
 
-最近一次学习中，配置模块测试分层已经完成轻量复习，并开始进入 async Rust。项目添加了 `tokio`，将 `main()` 接入 `#[tokio::main]`，将 `run()` 改为 `async fn`，并新增 `wait <seconds>` 命令练习 `tokio::time::sleep(...).await`。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，`wait 1` 正常运行，`wait 0` 能返回业务错误。
+最近一次学习中，async Rust 调用链已经完成轻量复习，并开始进入 HTTP 请求基础。项目添加了 `reqwest`，新增 `fetch <url>` 命令，使用 `reqwest::get(url).await?` 发起最小 HTTP GET 请求，并使用 `response.text().await?` 读取响应 body，打印前 200 个字符作为预览。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，用户本机验证 `fetch https://example.com` 可以正常打印 HTML 预览；Codex 执行环境中该请求出现 DNS 失败，判断为环境网络限制而非代码问题。
 
 ## Completed
 
@@ -165,10 +165,31 @@
 - 为 `wait` 命令设计业务校验：`seconds` 必须在 `1..=60`
 - 验证 `cargo run -- wait 1` 正常路径
 - 验证 `cargo run -- wait 0` 业务错误路径
+- 复习 `cargo run -- wait 1` 从 `main()` 到程序退出的完整 async 控制流
+- 理解 `#[tokio::main]` 通过宏生成 runtime 启动代码
+- 区分 `run().await`、`commands::wait::execute(seconds).await?`、`.await` 和 `?` 的职责
+- 理解 `.await` 先等待 `Future` 完成，`?` 再处理完成后的 `Result`
+- 理解同步命令和异步命令可以在同一个 CLI 中共存
+- 清理 `Cargo.toml` 中 `tokio` 依赖附近的多余空行
+- 实现 `fetch <url>` 命令骨架
+- 在 `src/cli.rs` 中为 `Commands` 增加 `Fetch { url: String }`
+- 新增 `src/commands/fetch.rs`
+- 在 `src/commands/mod.rs` 中导出 `fetch` 模块
+- 在 `src/main.rs` 中增加 `Fetch` 命令分发，并调用 `commands::fetch::execute(&url).await?`
+- 添加 `reqwest` 依赖
+- 使用 `reqwest::get(url).await?` 发起最小 HTTP GET 请求
+- 使用 `response.text().await?` 读取响应 body
+- 使用 `text.chars().take(200).collect()` 安全截取前 200 个字符
+- 初步理解 HTTP 请求通常至少包含“等待响应”和“读取 body”两个异步阶段
+- 初步理解网络错误、HTTP 状态码错误和 body 读取错误不是同一个层次的问题
+- 验证 `cargo run -- fetch https://example.com` 在用户本机可以正常打印 HTML 预览
+- 验证 `cargo fmt --check` 通过
+- 验证 `cargo check` 通过
+- 验证 `cargo test` 通过，当前 10 个测试全部通过
 
 ## In Progress
 
-继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验、模块边界、基础测试和 async Rust 入门推进：
+继续围绕配置读取、配置解析、错误输出边界、配置字段设计、配置业务校验、模块边界、基础测试、async Rust 入门和 HTTP 请求基础推进：
 
 - `serde::Deserialize`
 - `toml::from_str()`
@@ -197,24 +218,30 @@
 - `.await`
 - `tokio::time::sleep`
 - 同步命令和异步命令在同一个 CLI 中共存
+- `reqwest`
+- HTTP GET
+- `Response`
+- `response.text().await?`
+- 网络错误
+- HTTP 状态码
+- body 读取错误
+- 字符串字符级截取
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)` 是第一个异步命令，返回 `anyhow::Result<()>` 并通过 async 函数提供 `Future`。`run()` 当前负责解析 CLI、匹配子命令、调用同步命令或在 `Wait` 分支中 `.await` 异步命令，并使用 `?` 转发业务错误；`main()` 通过 Tokio runtime 驱动 `run().await`，统一打印 `error: ...` 和错误链，然后返回失败退出码。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)` 和 `fetch::execute(url)` 是当前两个异步命令，分别用于练习本地 timer 等待和真实 HTTP 请求等待。`run()` 当前负责解析 CLI、匹配子命令、调用同步命令或在异步命令分支中 `.await`，并使用 `?` 转发业务错误；`main()` 通过 Tokio runtime 驱动 `run().await`，统一打印 `error: ...` 和错误链，然后返回失败退出码。
 
 ## Next Step
 
-下一步建议先复习 async 调用链，确认第一个异步命令不是只停留在“能运行”：
+下一步建议先复习 `fetch` 的 async HTTP 调用链，确认 HTTP 请求不是只停留在“能运行”：
 
-- 解释 `cargo run -- wait 1` 从 `main()` 到程序退出的完整控制流
-- 解释 `#[tokio::main]` 在哪里启动 runtime
-- 解释 `run().await` 和 `commands::wait::execute(seconds).await?` 的执行顺序
-- 区分 `.await` 和 `?` 的职责
-- 解释为什么 `hello`、`sum`、`read-config` 暂时不需要改成 `async fn`
-- 清理 `Cargo.toml` 多余空行和 `src/config.rs` 中剩余 raw string TOML 缩进
+- 解释 `cargo run -- fetch https://example.com` 从 `main()` 到程序退出的完整控制流
+- 解释 `reqwest::get(url).await?` 在等待什么，以及 `?` 处理哪类错误
+- 解释 `response.text().await?` 在等待什么，以及 `?` 处理哪类错误
+- 区分网络错误、HTTP 状态码错误和 body 读取错误
+- 学习 `response.status()` 和 `error_for_status()`
+- 决定 `fetch` 是否需要先显式检查状态码，还是直接使用 `error_for_status()`
 
 完成这些理解后，再进入：
 
-- `reqwest`
-- HTTP 请求基础
 - OpenAI API
 - Agent loop
 
@@ -227,6 +254,7 @@ src
 ├── commands
 │   ├── echo.rs
 │   ├── divide.rs
+│   ├── fetch.rs
 │   ├── hello.rs
 │   ├── read_config.rs
 │   ├── repeat.rs
@@ -242,10 +270,10 @@ src
 当前职责划分：
 
 - `src/cli.rs`：定义 CLI 结构和子命令，不写业务逻辑
-- `src/commands/`：每个命令一个文件，负责具体业务逻辑；多数同步命令通过 `anyhow::Result<()>` 返回执行结果，`wait` 是当前第一个 async 命令
+- `src/commands/`：每个命令一个文件，负责具体业务逻辑；多数同步命令通过 `anyhow::Result<()>` 返回执行结果，`wait` 和 `fetch` 是当前异步命令
 - `src/commands/mod.rs`：统一导出命令模块
 - `src/config.rs`：定义配置模型、默认值、支持模型列表、业务校验和 `load_config(path)`
-- `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；`main()` 使用 `#[tokio::main]` 启动 runtime，调用 `run().await`，统一打印错误、打印错误链和设置失败退出码
+- `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands`、调用对应 `execute()`，并通过 `?` 转发错误；异步命令分支使用 `.await?`；`main()` 使用 `#[tokio::main]` 启动 runtime，调用 `run().await`，统一打印错误、打印错误链和设置失败退出码
 - `read-config` 当前用于配置读取和解析练习，负责调用 `config::load_config(path)` 并输出配置字段
 - `Config.model` 当前通过 `#[serde(default = "default_model")]` 缺失时默认使用 `gpt-4.1`
 - `Config.temperature` 当前通过 `#[serde(default = "default_temperature")]` 缺失时默认使用 `0.7`
@@ -256,6 +284,8 @@ src
 - `tempfile` 当前只作为 dev-dependency，用于配置模块测试
 - `wait <seconds>` 当前用于 async 入门练习，业务规则为 `seconds` 必须在 `1..=60`
 - `tokio` 当前作为普通 dependency，用于 runtime、宏和定时器能力
+- `fetch <url>` 当前用于 HTTP 请求基础练习，使用 `reqwest::get` 请求 URL，读取文本 body，并打印前 200 个字符
+- `reqwest` 当前作为普通 dependency，用于异步 HTTP 客户端能力
 
 新增命令时应遵循：
 
@@ -276,6 +306,9 @@ src
 - 当前配置模块测试是否已经足够支撑进入 async 和 HTTP 客户端学习？
 - `wait` 命令是否需要 CLI 行为测试，还是暂时作为手动验证的 async 练习命令？
 - `run()` 变成 async 后，后续是否应该保持同步命令原样，还是逐步统一命令接口？
+- `fetch` 遇到 HTTP 404/500 时应该打印 body、显示状态码，还是直接作为错误返回？
+- `fetch` 是否需要超时控制，避免网络请求长时间挂起？
+- 后续 OpenAI API 请求应直接放在 `commands::chat` 中，还是先抽出独立 HTTP/API 客户端模块？
 
 ## Technical Debt
 
@@ -285,13 +318,16 @@ src
 - 当前日志文件命名存在 `2026-7-13.md`、`2026-7-14.md`，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - 配置测试数据缩进可以继续整理，提高可读性
-- `Cargo.toml` 中 `tokio` 依赖附近有多余空行，可下次顺手清理
 - `src/config.rs` 中部分 raw string TOML 测试数据仍有缩进残留，可下次继续整理
+- `fetch` 当前没有显式处理 HTTP 非成功状态码
+- `fetch` 当前没有超时控制
+- `fetch` 当前没有自动化测试
 
 ## Next TODO
 
-- [ ] 解释 `cargo run -- wait 1` 的完整 async 控制流
-- [ ] 区分 `.await` 和 `?` 的职责
-- [ ] 清理 `Cargo.toml` 多余空行
+- [ ] 解释 `cargo run -- fetch https://example.com` 的完整 async HTTP 控制流
+- [ ] 区分网络错误、HTTP 状态码错误和 body 读取错误
+- [ ] 学习 `response.status()` 和 `error_for_status()`
+- [ ] 决定 `fetch` 的 HTTP 非成功状态码处理方式
 - [ ] 继续整理 `src/config.rs` 中 raw string TOML 测试数据缩进
-- [ ] 准备学习 `reqwest` 的基本请求模型
+- [ ] 准备进入 OpenAI API 请求的最小设计

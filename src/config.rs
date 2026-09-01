@@ -144,9 +144,8 @@ mod tests {
     #[test]
     fn load_config_adds_context_when_toml_parse_fails() {
         let file = write_temp_config(
-            r#"
-      temperature = "hot"
-      "#,
+            r#"temperature = "hot"
+            "#,
         );
 
         let error = load_config(file.path().to_str().unwrap()).unwrap_err();
