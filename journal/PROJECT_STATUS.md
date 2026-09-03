@@ -14,7 +14,7 @@
 
 当前重点不是快速实现 Agent，而是先建立清晰、可扩展的 CLI 架构，并逐步完善错误处理、配置处理模型、模块边界、基础测试和异步执行入口。项目已经完成 `run()` / `main()` 职责拆分，将命令错误模型迁移到 `anyhow::Result<()>`，并通过 `read-config` 命令练习了文件读取、TOML 解析、错误上下文、默认值和业务校验。
 
-最近一次学习中，async Rust 调用链已经完成轻量复习，并开始进入 HTTP 请求基础。项目添加了 `reqwest`，新增 `fetch <url>` 命令，使用 `reqwest::get(url).await?` 发起最小 HTTP GET 请求，并使用 `response.text().await?` 读取响应 body，打印前 200 个字符作为预览。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，用户本机验证 `fetch https://example.com` 可以正常打印 HTML 预览；Codex 执行环境中该请求出现 DNS 失败，判断为环境网络限制而非代码问题。
+最近一次学习中，继续复习了 `fetch` 的 async HTTP 调用链，并明确区分网络错误、HTTP 状态码和 body 读取错误。`fetch <url>` 已新增 `response.status()` 检查：当 HTTP status 不是成功状态码时，只打印 `status` 并正常返回，不继续读取 body。项目也开始为后续 OpenAI API 调用准备配置模型，新增 `OpenAiConfig`，并在 `Config` 中加入 `openai: Option<OpenAiConfig>`；`read-config` 只输出 OpenAI API key 是否设置，不打印真实 key。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，测试数量仍为 10 个。
 
 ## Completed
 
@@ -186,6 +186,27 @@
 - 验证 `cargo fmt --check` 通过
 - 验证 `cargo check` 通过
 - 验证 `cargo test` 通过，当前 10 个测试全部通过
+- 复习 `fetch` 命令从 `main()` 到程序退出的完整 async HTTP 控制流
+- 进一步理解 `.await` 先等待 `Future` 完成，`?` 再处理完成后的 `Result`
+- 学习 `response.status()` 读取 HTTP 状态码
+- 学习 `status.is_success()` 判断 HTTP status 是否为成功状态
+- 将 `fetch` 调整为遇到非成功 HTTP status 时打印状态码并正常返回
+- 对比理解 `response.status()` 和 `error_for_status()` 的适用边界
+- 初步讨论 OpenAI API 请求需要 URL、POST、Authorization header、JSON body 和 JSON response
+- 初步讨论 `chat` 命令和 OpenAI API 客户端模块的职责边界
+- 初步理解当前不需要过早引入 `trait LlmClient`
+- 初步讨论 `chat` 第一版 prompt 使用位置参数的设计
+- 初步讨论 API key 来源：环境变量、配置文件和命令参数的安全性与使用体验
+- 新增 `OpenAiConfig`
+- 将 `Config` 扩展为包含 `openai: Option<OpenAiConfig>`
+- 理解 `Some(value)` 表示有值，`None` 表示没有值
+- 理解 `Some(_)` 表示只关心有值，不关心具体内容
+- 使用 `match &config.openai` 检查 OpenAI 配置是否存在
+- 将 `read-config` 调整为只输出 OpenAI API key 是否设置，不泄露真实 key
+- 通过修复编译错误，进一步理解 `Ok(())`、`Result<()>`、import 和函数返回值表达式的关系
+- 验证 `cargo fmt --check` 通过
+- 验证 `cargo check` 通过
+- 验证 `cargo test` 通过，当前 10 个测试全部通过
 
 ## In Progress
 
@@ -224,26 +245,35 @@
 - `response.text().await?`
 - 网络错误
 - HTTP 状态码
+- `response.status()`
+- `status.is_success()`
+- `error_for_status()`
 - body 读取错误
 - 字符串字符级截取
+- `Option<OpenAiConfig>`
+- `Some`
+- `None`
+- `match` guard
+- API key 配置边界
+- 密钥输出安全边界
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)` 和 `fetch::execute(url)` 是当前两个异步命令，分别用于练习本地 timer 等待和真实 HTTP 请求等待。`run()` 当前负责解析 CLI、匹配子命令、调用同步命令或在异步命令分支中 `.await`，并使用 `?` 转发业务错误；`main()` 通过 Tokio runtime 驱动 `run().await`，统一打印 `error: ...` 和错误链，然后返回失败退出码。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)` 和 `fetch::execute(url)` 是当前两个异步命令，分别用于练习本地 timer 等待和真实 HTTP 请求等待。`fetch` 当前会先检查 HTTP status：成功状态码继续读取 body 并打印 preview，非成功状态码只打印 `status` 并返回 `Ok(())`。`run()` 当前负责解析 CLI、匹配子命令、调用同步命令或在异步命令分支中 `.await`，并使用 `?` 转发业务错误；`main()` 通过 Tokio runtime 驱动 `run().await`，统一打印 `error: ...` 和错误链，然后返回失败退出码。
 
 ## Next Step
 
-下一步建议先复习 `fetch` 的 async HTTP 调用链，确认 HTTP 请求不是只停留在“能运行”：
+下一步建议先为新增 OpenAI 配置模型补充最小测试，避免配置结构变化只停留在手动验证：
 
-- 解释 `cargo run -- fetch https://example.com` 从 `main()` 到程序退出的完整控制流
-- 解释 `reqwest::get(url).await?` 在等待什么，以及 `?` 处理哪类错误
-- 解释 `response.text().await?` 在等待什么，以及 `?` 处理哪类错误
-- 区分网络错误、HTTP 状态码错误和 body 读取错误
-- 学习 `response.status()` 和 `error_for_status()`
-- 决定 `fetch` 是否需要先显式检查状态码，还是直接使用 `error_for_status()`
+- 测试缺少 `[openai]` 时 `config.openai` 为 `None`
+- 测试存在 `[openai] api_key` 时 `config.openai` 为 `Some`
+- 确认测试中不打印、不暴露真实 API key
 
-完成这些理解后，再进入：
+完成这些测试后，再设计第一版 `chat` 命令：
 
-- OpenAI API
-- Agent loop
+- 位置参数 prompt
+- 配置文件读取路径
+- OpenAI API key 缺失时的错误信息
+- `src/openai.rs` 的最小函数边界
+- OpenAI API 状态码处理策略
 
 ## Architecture Notes
 
@@ -277,6 +307,8 @@ src
 - `read-config` 当前用于配置读取和解析练习，负责调用 `config::load_config(path)` 并输出配置字段
 - `Config.model` 当前通过 `#[serde(default = "default_model")]` 缺失时默认使用 `gpt-4.1`
 - `Config.temperature` 当前通过 `#[serde(default = "default_temperature")]` 缺失时默认使用 `0.7`
+- `Config.openai` 当前为 `Option<OpenAiConfig>`，用于表达配置文件中可能存在或缺少 `[openai]` 配置
+- `OpenAiConfig.api_key` 当前只用于判断 key 是否设置；`read-config` 不打印真实 key
 - `Config::validate()` 当前校验模型支持列表和 `temperature` 范围
 - `SUPPORTED_MODELS` 当前定义了允许的模型列表：`gpt-4.1`、`gpt-4.1-mini`
 - `Config` 和需要跨模块读取的字段当前使用 `pub` 暴露给命令层
@@ -284,7 +316,7 @@ src
 - `tempfile` 当前只作为 dev-dependency，用于配置模块测试
 - `wait <seconds>` 当前用于 async 入门练习，业务规则为 `seconds` 必须在 `1..=60`
 - `tokio` 当前作为普通 dependency，用于 runtime、宏和定时器能力
-- `fetch <url>` 当前用于 HTTP 请求基础练习，使用 `reqwest::get` 请求 URL，读取文本 body，并打印前 200 个字符
+- `fetch <url>` 当前用于 HTTP 请求基础练习，使用 `reqwest::get` 请求 URL；成功状态码读取文本 body 并打印前 200 个字符，非成功状态码只打印 `status`
 - `reqwest` 当前作为普通 dependency，用于异步 HTTP 客户端能力
 
 新增命令时应遵循：
@@ -306,9 +338,11 @@ src
 - 当前配置模块测试是否已经足够支撑进入 async 和 HTTP 客户端学习？
 - `wait` 命令是否需要 CLI 行为测试，还是暂时作为手动验证的 async 练习命令？
 - `run()` 变成 async 后，后续是否应该保持同步命令原样，还是逐步统一命令接口？
-- `fetch` 遇到 HTTP 404/500 时应该打印 body、显示状态码，还是直接作为错误返回？
 - `fetch` 是否需要超时控制，避免网络请求长时间挂起？
-- 后续 OpenAI API 请求应直接放在 `commands::chat` 中，还是先抽出独立 HTTP/API 客户端模块？
+- `read-config` 是否应该长期展示密钥设置状态，还是只作为当前学习阶段的调试输出？
+- 后续 `chat` 命令应该如何指定配置文件路径？
+- 后续 `chat` 命令应优先读取环境变量 `OPENAI_API_KEY`，还是配置文件 `[openai].api_key`？
+- 后续 OpenAI API 请求模块应命名为 `src/openai.rs`，还是提前放入 `src/llm/openai.rs`？
 
 ## Technical Debt
 
@@ -319,15 +353,16 @@ src
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - 配置测试数据缩进可以继续整理，提高可读性
 - `src/config.rs` 中部分 raw string TOML 测试数据仍有缩进残留，可下次继续整理
-- `fetch` 当前没有显式处理 HTTP 非成功状态码
 - `fetch` 当前没有超时控制
 - `fetch` 当前没有自动化测试
+- `Config.openai` 当前没有专门的单元测试
+- `read-config` 的 OpenAI key 状态输出当前没有自动化测试
 
 ## Next TODO
 
-- [ ] 解释 `cargo run -- fetch https://example.com` 的完整 async HTTP 控制流
-- [ ] 区分网络错误、HTTP 状态码错误和 body 读取错误
-- [ ] 学习 `response.status()` 和 `error_for_status()`
-- [ ] 决定 `fetch` 的 HTTP 非成功状态码处理方式
-- [ ] 继续整理 `src/config.rs` 中 raw string TOML 测试数据缩进
-- [ ] 准备进入 OpenAI API 请求的最小设计
+- [ ] 为缺少 `[openai]` 的配置添加测试
+- [ ] 为存在 `[openai] api_key` 的配置添加测试
+- [ ] 设计第一版 `chat` 命令的 CLI 参数
+- [ ] 决定 `chat` 命令从哪里读取配置文件
+- [ ] 设计 `src/openai.rs` 的最小函数边界
+- [ ] 设计 OpenAI API key 缺失时的错误信息

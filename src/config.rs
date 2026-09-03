@@ -4,12 +4,19 @@ use serde::Deserialize;
 const SUPPORTED_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini"];
 
 #[derive(Debug, Deserialize)]
+pub struct OpenAiConfig {
+    pub api_key: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default = "default_model")]
     pub model: String,
 
     #[serde(default = "default_temperature")]
     pub temperature: f64,
+
+    pub openai: Option<OpenAiConfig>,
 }
 
 pub fn load_config(path: &str) -> Result<Config> {
@@ -66,6 +73,7 @@ mod tests {
         let config = Config {
             model: "unknown-model".to_string(),
             temperature: 0.7,
+            openai: None,
         };
 
         let result = config.validate();
@@ -77,6 +85,7 @@ mod tests {
         let config = Config {
             model: "gpt-4.1".to_string(),
             temperature: 3.0,
+            openai: None,
         };
 
         let result = config.validate();
