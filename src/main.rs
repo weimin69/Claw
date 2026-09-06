@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod openai;
 
 use crate::cli::{Cli, Commands};
 use anyhow::Result;
@@ -52,6 +53,12 @@ async fn run() -> Result<()> {
         }
         Commands::Fetch { url } => {
             commands::fetch::execute(&url).await?;
+        }
+        Commands::Chat {
+            config_path,
+            prompt,
+        } => {
+            commands::chat::execute(&config_path, &prompt).await?;
         }
     }
     Ok(())

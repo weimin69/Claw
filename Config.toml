@@ -1,0 +1,5 @@
+[llm]
+base_url = "https://api.deepseek.com"
+api_key = ""
+model = "deepseek-v4-flash"
+temperature = 0.7

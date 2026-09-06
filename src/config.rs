@@ -1,22 +1,36 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-const SUPPORTED_MODELS: &[&str] = &["gpt-4.1", "gpt-4.1-mini"];
-
 #[derive(Debug, Deserialize)]
-pub struct OpenAiConfig {
+pub struct LlmConfig {
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+
+    #[serde(default)]
     pub api_key: String,
-}
 
-#[derive(Debug, Deserialize)]
-pub struct Config {
     #[serde(default = "default_model")]
     pub model: String,
 
     #[serde(default = "default_temperature")]
     pub temperature: f64,
+}
 
-    pub openai: Option<OpenAiConfig>,
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_base_url(),
+            api_key: String::new(),
+            model: default_model(),
+            temperature: default_temperature(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    #[serde(default)]
+    pub llm: LlmConfig,
 }
 
 pub fn load_config(path: &str) -> Result<Config> {
@@ -30,6 +44,10 @@ pub fn load_config(path: &str) -> Result<Config> {
     Ok(config)
 }
 
+fn default_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
+
 fn default_model() -> String {
     "gpt-4.1".to_string()
 }
@@ -40,15 +58,11 @@ fn default_temperature() -> f64 {
 
 impl Config {
     fn validate(&self) -> Result<()> {
-        if !SUPPORTED_MODELS.contains(&self.model.as_str()) {
-            bail!(
-                "unsupported model: {}. supported models: {}",
-                self.model,
-                SUPPORTED_MODELS.join(", ")
-            );
+        if self.llm.model.trim().is_empty() {
+            bail!("model must not be empty");
         }
 
-        if self.temperature < 0.0 || self.temperature > 2.0 {
+        if self.llm.temperature < 0.0 || self.llm.temperature > 2.0 {
             bail!("temperature must be between 0.0 and 2.0");
         }
 
@@ -64,16 +78,21 @@ mod tests {
     fn applies_default_values_when_fields_are_missing() {
         let config: Config = toml::from_str("").unwrap();
 
-        assert_eq!(config.model, "gpt-4.1");
-        assert_eq!(config.temperature, 0.7);
+        assert_eq!(config.llm.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.llm.api_key, "");
+        assert_eq!(config.llm.model, "gpt-4.1");
+        assert_eq!(config.llm.temperature, 0.7);
     }
 
     #[test]
-    fn rejects_unsupported_model() {
+    fn rejects_empty_model() {
         let config = Config {
-            model: "unknown-model".to_string(),
-            temperature: 0.7,
-            openai: None,
+            llm: LlmConfig {
+                base_url: "https://api.deepseek.com".to_string(),
+                api_key: String::new(),
+                model: "   ".to_string(),
+                temperature: 0.7,
+            },
         };
 
         let result = config.validate();
@@ -83,9 +102,12 @@ mod tests {
     #[test]
     fn rejects_temperature_out_of_range() {
         let config = Config {
-            model: "gpt-4.1".to_string(),
-            temperature: 3.0,
-            openai: None,
+            llm: LlmConfig {
+                base_url: "https://api.deepseek.com".to_string(),
+                api_key: String::new(),
+                model: "deepseek-v4-pro".to_string(),
+                temperature: 3.0,
+            },
         };
 
         let result = config.validate();
@@ -95,7 +117,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_temperature_type() {
-        let result = toml::from_str::<Config>(r#"temperature ="hot""#);
+        let result = toml::from_str::<Config>(
+            r#"[llm]
+temperature = "hot"
+"#,
+        );
 
         assert!(result.is_err());
     }
@@ -103,15 +129,20 @@ mod tests {
     #[test]
     fn loads_config_from_file() {
         let file = write_temp_config(
-            r#"model = "gpt-4.1-mini"
-               temperature = 1.0
-      "#,
+            r#"[llm]
+base_url = "https://api.deepseek.com"
+api_key = "test-key"
+model = "deepseek-v4-pro"
+temperature = 1.0
+"#,
         );
 
         let config = load_config(file.path().to_str().unwrap()).unwrap();
 
-        assert_eq!(config.model, "gpt-4.1-mini");
-        assert_eq!(config.temperature, 1.0);
+        assert_eq!(config.llm.base_url, "https://api.deepseek.com");
+        assert_eq!(config.llm.api_key, "test-key");
+        assert_eq!(config.llm.model, "deepseek-v4-pro");
+        assert_eq!(config.llm.temperature, 1.0);
     }
 
     #[test]
@@ -120,16 +151,19 @@ mod tests {
 
         let config = load_config(file.path().to_str().unwrap()).unwrap();
 
-        assert_eq!(config.model, "gpt-4.1");
-        assert_eq!(config.temperature, 0.7);
+        assert_eq!(config.llm.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.llm.api_key, "");
+        assert_eq!(config.llm.model, "gpt-4.1");
+        assert_eq!(config.llm.temperature, 0.7);
     }
 
     #[test]
-    fn load_config_rejects_unsupported_model() {
+    fn load_config_rejects_empty_model() {
         let file = write_temp_config(
-            r#"model = "unknown-model"
-               temperature = 0.7
-      "#,
+            r#"[llm]
+model = ""
+temperature = 0.7
+"#,
         );
 
         let result = load_config(file.path().to_str().unwrap());
@@ -140,9 +174,10 @@ mod tests {
     #[test]
     fn load_config_rejects_temperature_out_of_range() {
         let file = write_temp_config(
-            r#"model = "gpt-4.1"
-            temperature = 3.0
-      "#,
+            r#"[llm]
+model = "deepseek-v4-pro"
+temperature = 3.0
+"#,
         );
 
         let result = load_config(file.path().to_str().unwrap());
@@ -153,8 +188,9 @@ mod tests {
     #[test]
     fn load_config_adds_context_when_toml_parse_fails() {
         let file = write_temp_config(
-            r#"temperature = "hot"
-            "#,
+            r#"[llm]
+temperature = "hot"
+"#,
         );
 
         let error = load_config(file.path().to_str().unwrap()).unwrap_err();

@@ -3,19 +3,15 @@ use anyhow::Result;
 pub fn execute(path: &str) -> Result<()> {
     let config = crate::config::load_config(path)?;
 
-    println!("model: {}", config.model);
-    println!("temperature: {}", config.temperature);
+    println!("llm base url: {}", config.llm.base_url);
+    println!("model: {}", config.llm.model);
+    println!("temperature: {}", config.llm.temperature);
 
-    match &config.openai {
-        Some(openai) if !openai.api_key.is_empty() => {
-            println!("openai api key: set");
-        }
-        Some(_) => {
-            println!("openai api key: empty");
-        }
-        None => {
-            println!("openai api key: not set");
-        }
+    if config.llm.api_key.trim().is_empty() {
+        println!("llm api key: empty");
+    } else {
+        println!("llm api key: set");
     }
+
     Ok(())
 }

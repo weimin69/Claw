@@ -1,3 +1,4 @@
+pub mod chat;
 pub mod divide;
 pub mod echo;
 pub mod fetch;

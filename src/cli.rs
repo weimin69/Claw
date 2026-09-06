@@ -43,4 +43,8 @@ pub enum Commands {
     Fetch {
         url: String,
     },
+    Chat {
+        config_path: String,
+        prompt: String,
+    },
 }
