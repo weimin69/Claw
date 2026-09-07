@@ -40,15 +40,24 @@ pub async fn send_chat_request(
     let request = build_chat_request(model, temperature, prompt);
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let response = client
         .post(url)
         .bearer_auth(api_key)
         .json(&request)
         .send()
-        .await?;
+        .await
+        .context("failed to send chat request")?;
 
     let status = response.status();
-    let text = response.text().await?;
+    let text = response
+        .text()
+        .await
+        .context("failed to read chat response body")?;
 
     ensure_success_status(status)?;
 
