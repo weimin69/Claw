@@ -51,8 +51,8 @@ async fn run() -> Result<()> {
         Commands::Wait { seconds } => {
             commands::wait::execute(seconds).await?;
         }
-        Commands::Fetch { url } => {
-            commands::fetch::execute(&url).await?;
+        Commands::Fetch { url, max_chars } => {
+            commands::fetch::execute(&url, max_chars).await?;
         }
         Commands::Chat {
             config_path,

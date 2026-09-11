@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，将 `chat` 中学到的 async HTTP 失败路径迁移到了 `fetch` 命令。`fetch` 现在使用 `reqwest::Client::builder()` 创建 client，并为请求设置 60 秒 timeout；client 构造、`.send().await` 和 `response.text().await` 都添加了明确的错误上下文；非 2xx HTTP status 会通过 `bail!()` 返回错误并触发非 0 exit code。学习中还引入了 `assert_cmd`、`predicates` 和 `wiremock`，为 `fetch` 添加了成功路径和 404 错误路径的 CLI 集成测试。当前 `cargo fmt --check`、`cargo check`、`cargo test` 均通过，测试数量为 17 个单元测试和 2 个集成测试。
+最近一次学习中，围绕 `fetch` 的 CLI 用户契约做了小步扩展。`fetch` 新增 `--max-chars <MAX_CHARS>` 参数，默认值为 `200`，用于控制响应 body preview 的最大字符数；preview 截断逻辑被抽成 `preview_text(text, max_chars)` 纯函数，并使用 `.chars()` 按字符截断以支持 Unicode 文本。`--max-chars 0` 通过 clap 自定义 parser `parse_positive_usize` 在参数解析阶段拒绝。学习中补充了 `preview_text` 单元测试、`fetch --max-chars` CLI 集成测试和非法参数集成测试。当前 `cargo check` 和 `cargo test` 均通过，测试数量为 18 个单元测试和 4 个 `fetch` CLI 集成测试。
 
 ## Completed
 
@@ -97,9 +97,16 @@
 - 新增 `tests/fetch_cli.rs` CLI 集成测试文件
 - 为 `fetch` 成功响应添加 CLI 集成测试
 - 为 `fetch` 非 2xx status 添加 CLI 集成测试
-- 当前 `cargo fmt --check` 通过
+- 为 `fetch` 添加 `--max-chars <MAX_CHARS>` 参数
+- `fetch --max-chars` 默认值为 `200`
+- 将 `fetch` response preview 截断逻辑抽成 `preview_text(text, max_chars)` 纯函数
+- 使用 `.chars()` 按字符数截断 preview，避免按字节破坏 UTF-8 文本
+- 为 `preview_text` 添加单元测试，覆盖英文、中文和最大长度超过文本长度的情况
+- 为 `fetch --max-chars` 添加 CLI 集成测试
+- 使用 clap 自定义 parser `parse_positive_usize` 校验 `--max-chars` 必须大于 0
+- 为 `fetch --max-chars 0` 添加 CLI 参数错误集成测试
 - 当前 `cargo check` 通过
-- 当前 `cargo test` 通过，17 个单元测试和 2 个集成测试全部通过
+- 当前 `cargo test` 通过，18 个单元测试和 4 个 `fetch` CLI 集成测试全部通过
 
 ## In Progress
 
@@ -157,19 +164,25 @@
 - CLI 集成测试
 - mock HTTP server
 - stdout / stderr / exit code 测试
+- clap 自定义 value parser
+- CLI 参数合法性校验
+- 函数作为 parser 传给 clap，而不是立即调用
+- Rust 函数末尾表达式返回值
+- 字符截断和字节长度的区别
 - API key 配置边界
 - 密钥输出安全边界
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。
 
 ## Next Step
 
-下一步围绕 `fetch` 的 CLI 集成测试做复盘和小步扩展：
+下一步围绕本次 `fetch --max-chars` 做复盘，并决定下一个小步测试目标：
 
-- Review `tests/fetch_cli.rs` 中 `assert_cmd`、`predicates` 和 `wiremock` 的职责
-- 讨论 CLI 集成测试和单元测试的边界
-- 讨论是否添加一个小型参数，例如 `fetch --max-chars`，用于练习 CLI 参数设计和测试拆分
-- 如果添加 `--max-chars`，优先将 preview 截断逻辑抽成小的纯函数，再分别添加单元测试和集成测试
+- 复述 `fetch --max-chars` 从 CLI 输入到 stdout 的完整控制流
+- Review `parse_positive_usize` 为什么属于 CLI 参数解析边界
+- Review `preview_text` 单元测试和 `fetch_cli` 集成测试的职责差异
+- 讨论当前 `fetch` 的测试覆盖是否足够进入下一个小目标
+- 决定下一步是为另一个普通命令补 CLI 集成测试，还是开始讨论 `chat` 的可测试性边界
 
 优先学习目标仍然是 CLI 用户契约、确定性测试、错误输出边界和 async HTTP 行为，而不是继续扩展 Agent 功能。
 
@@ -208,7 +221,7 @@
 - `src/config.rs`：定义配置模型、默认值、业务校验和 `load_config(path)`
 - `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
-- `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr 和 exit code
+- `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 
 配置格式当前为：
 
@@ -232,7 +245,7 @@ temperature = 0.7
 
 - `src/openai.rs` 是否应重命名为 `src/llm.rs` 或 `src/llm/openai_compatible.rs`？
 - `send_chat_request()` 是否应该继续在函数内创建新的 `reqwest::Client`，还是等 Agent runtime 阶段再引入 client 复用？
-- `fetch` 是否需要支持 `--max-chars` 控制 preview 长度？
+- `fetch --max-chars` 是否需要增加上限，避免用户意外读取和输出过大的 preview？
 - 非 2xx status 是否只输出 status 足够，还是需要后续通过 `--verbose` 暴露 provider 错误 body？
 - `chat` 命令是否应支持从环境变量读取 API key？
 - `chat` 命令是否应支持 stdin 输入 prompt？
@@ -253,7 +266,7 @@ temperature = 0.7
 
 ## Next TODO
 
-- [ ] Review `assert_cmd` 和 `wiremock` 测试结构
-- [ ] 讨论 `fetch --max-chars` 是否适合作为下一个小功能
-- [ ] 讨论 preview 截断逻辑是否应抽成纯函数
-- [ ] 练习单元测试和 CLI 集成测试的职责拆分
+- [ ] 复述 `fetch --max-chars` 从 clap 解析到 stdout 输出的完整控制流
+- [ ] 解释 `parse_positive_usize`、`preview_text`、`fetch_cli` 三者各自的职责边界
+- [ ] 讨论是否为另一个普通命令补 CLI 集成测试
+- [ ] 初步讨论 `chat` 命令如何在不依赖真实 LLM 的情况下测试
