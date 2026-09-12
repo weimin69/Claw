@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，围绕 `fetch` 的 CLI 用户契约做了小步扩展。`fetch` 新增 `--max-chars <MAX_CHARS>` 参数，默认值为 `200`，用于控制响应 body preview 的最大字符数；preview 截断逻辑被抽成 `preview_text(text, max_chars)` 纯函数，并使用 `.chars()` 按字符截断以支持 Unicode 文本。`--max-chars 0` 通过 clap 自定义 parser `parse_positive_usize` 在参数解析阶段拒绝。学习中补充了 `preview_text` 单元测试、`fetch --max-chars` CLI 集成测试和非法参数集成测试。当前 `cargo check` 和 `cargo test` 均通过，测试数量为 18 个单元测试和 4 个 `fetch` CLI 集成测试。
+最近一次学习中，复盘了 `fetch --max-chars` 的控制流、CLI 参数解析边界、单元测试和集成测试的职责差异，并开始为 `chat` 命令建立确定性的 CLI 集成测试。新增 `tests/chat_cli.rs`，使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。当前已覆盖 `chat` happy path，以及缺少 `llm.api_key` 时的错误路径。`cargo test --test chat_cli` 通过，2 个 `chat` CLI 集成测试全部通过。
 
 ## Completed
 
@@ -105,8 +105,16 @@
 - 为 `fetch --max-chars` 添加 CLI 集成测试
 - 使用 clap 自定义 parser `parse_positive_usize` 校验 `--max-chars` 必须大于 0
 - 为 `fetch --max-chars 0` 添加 CLI 参数错误集成测试
+- 新增 `tests/chat_cli.rs` CLI 集成测试文件
+- 使用 `wiremock` 为 `chat` 命令提供确定性的本地 mock HTTP server
+- 使用 `tempfile::NamedTempFile` 在 `chat` CLI 集成测试中创建临时 `[llm]` 配置
+- 为 `chat` happy path 添加 CLI 集成测试，验证 assistant content 输出到 stdout
+- 为缺少 `llm.api_key` 添加 CLI 错误路径测试
+- 理解自动化测试不应直接调用真实 LLM API
+- 理解 `cargo test --test chat_cli` 中测试 target 名不包含 `.rs`
+- 理解 `Command::cargo_bin(...)` 的 binary 名应匹配 Cargo package/bin 名
 - 当前 `cargo check` 通过
-- 当前 `cargo test` 通过，18 个单元测试和 4 个 `fetch` CLI 集成测试全部通过
+- 当前 `cargo test --test chat_cli` 通过，2 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
 
@@ -164,6 +172,9 @@
 - CLI 集成测试
 - mock HTTP server
 - stdout / stderr / exit code 测试
+- LLM CLI 集成测试
+- 临时配置文件测试
+- 不依赖真实 provider 的确定性测试
 - clap 自定义 value parser
 - CLI 参数合法性校验
 - 函数作为 parser 传给 clap，而不是立即调用
@@ -172,17 +183,17 @@
 - API key 配置边界
 - 密钥输出安全边界
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API。
 
 ## Next Step
 
-下一步围绕本次 `fetch --max-chars` 做复盘，并决定下一个小步测试目标：
+下一步围绕 `chat` CLI 集成测试继续小步推进：
 
-- 复述 `fetch --max-chars` 从 CLI 输入到 stdout 的完整控制流
-- Review `parse_positive_usize` 为什么属于 CLI 参数解析边界
-- Review `preview_text` 单元测试和 `fetch_cli` 集成测试的职责差异
-- 讨论当前 `fetch` 的测试覆盖是否足够进入下一个小目标
-- 决定下一步是为另一个普通命令补 CLI 集成测试，还是开始讨论 `chat` 的可测试性边界
+- 清理 `tests/chat_cli.rs` 的字符串缩进、多余空行和临时注释
+- 为 `chat` provider 非 2xx status 添加 CLI 错误路径测试
+- 复盘 `chat` happy path 测试中 `wiremock`、临时 config 和 `assert_cmd` 的职责边界
+- 讨论 `chat` 的 CLI 集成测试和 `openai.rs` 单元测试如何分工
+- 判断当前 `chat` 测试覆盖是否足够进入下一个小目标
 
 优先学习目标仍然是 CLI 用户契约、确定性测试、错误输出边界和 async HTTP 行为，而不是继续扩展 Agent 功能。
 
@@ -210,7 +221,8 @@
 │       ├── version.rs
 │       └── mod.rs
 └── tests/
-    └── fetch_cli.rs
+    ├── fetch_cli.rs
+    └── chat_cli.rs
 ```
 
 当前职责划分：
@@ -222,6 +234,7 @@
 - `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
+- `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code 和配置边界
 
 配置格式当前为：
 
@@ -249,6 +262,8 @@ temperature = 0.7
 - 非 2xx status 是否只输出 status 足够，还是需要后续通过 `--verbose` 暴露 provider 错误 body？
 - `chat` 命令是否应支持从环境变量读取 API key？
 - `chat` 命令是否应支持 stdin 输入 prompt？
+- `chat` 是否还需要 provider 非 2xx status 的 CLI 集成测试？
+- `chat` 是否还需要断言请求 body / Authorization header？
 - 是否需要继续为更多命令增加集成测试？
 - 是否需要将 `parse_chat_response()` 暴露为更明确的模块边界，还是保持私有函数？
 - 是否需要将 LLM provider 配置与通用 CLI 配置进一步分层？
@@ -256,6 +271,7 @@ temperature = 0.7
 ## Technical Debt
 
 - `PROJECT_STATUS.md` 实际位于 `journal/PROJECT_STATUS.md`，不是仓库根目录
+- `tests/chat_cli.rs` 当前存在可读性清理空间：JSON/TOML 缩进、多余空行和临时解释性注释
 - 当前日志文件命名存在 `2026-7-13.md` 这类非标准格式，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
