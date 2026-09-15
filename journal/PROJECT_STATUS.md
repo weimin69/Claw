@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，继续完善 `chat` 命令的确定性 CLI 集成测试。当前 `tests/chat_cli.rs` 使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。已覆盖 `chat` happy path、缺少 `llm.api_key`、provider 返回非 2xx status，以及 happy path 请求体中的 `model`、`temperature`、`messages` 和 `stream`。同时复盘了 CLI 集成测试与 `openai.rs` 单元测试的分工、`chat.rs` / `config.rs` / `openai.rs` 的模块边界，以及 `reqwest::Client` 当前创建方式和未来 Agent Runtime 复用方向。`cargo test --test chat_cli` 通过，3 个 `chat` CLI 集成测试全部通过。
+最近一次学习中，没有修改生产代码，主要复盘了 `chat` 命令确定性 CLI 集成测试的设计意义。当前 `tests/chat_cli.rs` 使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。已覆盖 `chat` happy path、缺少 `llm.api_key`、provider 返回非 2xx status，以及 happy path 请求体中的 `model`、`temperature`、`messages` 和 `stream`。本次重点澄清了为什么自动化测试不应调用真实 LLM API、`chat.rs` / `config.rs` / `openai.rs` 的模块职责边界，以及 provider 错误路径中 stdout 为空断言对 CLI 用户契约的价值。`tests/chat_cli.rs` 的格式清理和 provider 错误路径 stdout 断言仍是下一步。
 
 ## Completed
 
@@ -116,6 +116,8 @@
 - 理解 provider 错误路径测试应先保证配置合法，避免提前停在配置校验阶段
 - 理解 `chat_cli.rs` 集成测试和 `openai.rs` 单元测试的分工
 - 理解 `chat.rs`、`config.rs`、`openai.rs` 的职责边界
+- 理解 `wiremock` 让 `chat` CLI 集成测试不依赖真实网络、真实 API key、provider 可用性、余额、限流或模型行为变化
+- 理解 provider 错误路径断言 stdout 为空是在保护 CLI 用户输出契约
 - 理解 `mod openai;` 是将 `src/openai.rs` 加入 crate 模块树
 - 初步讨论 `reqwest::Client` 当前函数内创建与未来 Agent Runtime 复用的取舍
 - 理解自动化测试不应直接调用真实 LLM API
@@ -202,7 +204,7 @@
 下一步围绕 `chat` CLI 集成测试收尾并进入下一个小目标：
 
 - 清理 `tests/chat_cli.rs` 的字符串缩进、import 顺序、多余空行和格式细节
-- 判断是否需要为 provider 错误路径补充 stdout 为空的断言
+- 判断并实现 provider 错误路径 stdout 为空的断言
 - 复盘当前 `chat` 测试覆盖，确认可以停止继续堆测试
 - 准备进入下一个小目标：继续围绕 CLI 用户契约、错误边界和模块职责推进
 
@@ -292,6 +294,6 @@ temperature = 0.7
 ## Next TODO
 
 - [ ] 清理 `tests/chat_cli.rs` 的 TOML/JSON 缩进、import 顺序和空行格式
-- [ ] 判断 `chat_reports_provider_error_status` 是否需要补充 stdout 为空的断言
+- [ ] 判断并补充 `chat_reports_provider_error_status` 的 stdout 为空断言
 - [ ] 复盘当前 `chat` CLI 集成测试覆盖，确认可以进入下一个小目标
 - [ ] 继续讨论下一个 CLI/LLM 小目标，暂不提前扩展 Agent Runtime
