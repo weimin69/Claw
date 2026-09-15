@@ -141,8 +141,9 @@ mod tests {
     #[test]
     fn rejects_chat_response_without_choices() {
         let error = parse_chat_response(
-            r#"{ "choices":
-            [] }"#,
+            r#"{
+            "choices": []
+            }"#,
         )
         .unwrap_err();
 
@@ -152,6 +153,7 @@ mod tests {
                 .contains("chat response did not contain any choices")
         );
     }
+
     #[test]
     fn rejects_chat_response_without_content() {
         let error = parse_chat_response(

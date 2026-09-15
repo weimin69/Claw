@@ -1,11 +1,18 @@
+use std::io::Write;
+
 use assert_cmd::Command;
-use predicates::str::contains;
+use predicates::str::{contains, is_empty};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_json, method, path},
 };
 
-use std::io::Write;
+fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(contents.as_bytes()).unwrap();
+    file
+}
+
 #[tokio::test]
 async fn chat_prints_assistant_response_from_mock_server() {
     let server = MockServer::start().await;
@@ -13,43 +20,39 @@ async fn chat_prints_assistant_response_from_mock_server() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(body_json(serde_json::json!({
-              "model": "test-model",
-              "temperature": 0.7,
-              "messages": [
-                  {
-                      "role": "user",
-                      "content": "hello"
-                  }
-              ],
-              "stream": false
-          })))
+            "model": "test-model",
+            "temperature": 0.7,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hello"
+                }
+            ],
+            "stream": false
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_string(
             r#"{
-                              "choices": [
-                                  {
-                                      "message": {
-                                          "content": "Hello from mock assistant"
-                                      }
-                                  }
-                              ]
-                          }"#,
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Hello from mock assistant"
+                        }
+                    }
+                ]
+            }"#,
         ))
         .mount(&server)
         .await;
 
-    let mut config_file = tempfile::NamedTempFile::new().unwrap();
-
-    write!(
-        config_file,
+    let config_file = write_temp_config(&format!(
         r#"[llm]
-      base_url = "{}"
-      api_key = "test-key"
-      model = "test-model"
-      temperature = 0.7
-      "#,
+    base_url = "{}"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
         server.uri()
-    )
-    .unwrap();
+    ));
 
     let config_path = config_file.path().to_str().unwrap();
 
@@ -60,23 +63,19 @@ async fn chat_prints_assistant_response_from_mock_server() {
         .arg("hello")
         .assert()
         .success()
-        .stdout(contains("Hello from mock assistant"));
+        .stdout(contains("Hello from mock assistant"))
+        .stderr(is_empty());
 }
 
 #[test]
 fn chat_rejects_missing_api_key() {
-    let mut config_file = tempfile::NamedTempFile::new().unwrap();
-
-    write!(
-        config_file,
-      r#"[llm]
-      base_url = "https://127.0.0.1:1"
-      model = "test-model"
-      temperature = 0.7
-      "#,
-    )
-    .unwrap();
-
+    let config_file = write_temp_config(
+        r#"[llm]
+    base_url = "https://127.0.0.1:1"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+    );
     let config_path = config_file.path().to_str().unwrap();
 
     let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
@@ -86,7 +85,8 @@ fn chat_rejects_missing_api_key() {
         .arg("hello")
         .assert()
         .failure()
-        .stderr(contains("missing llm api key"));
+        .stderr(contains("missing llm api key"))
+        .stdout(is_empty());
 }
 
 #[tokio::test]
@@ -99,19 +99,15 @@ async fn chat_reports_provider_error_status() {
         .mount(&server)
         .await;
 
-    let mut config_file = tempfile::NamedTempFile::new().unwrap();
-
-    write!(
-        config_file,
-      r#"[llm]
-      base_url = "{}"
-      api_key = "test_key"
-      model = "test-model"
-      temperature = 0.7
-      "#,
+    let config_file = write_temp_config(&format!(
+        r#"[llm]
+    base_url = "{}"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
         server.uri()
-    )
-    .unwrap();
+    ));
 
     let config_path = config_file.path().to_str().unwrap();
 
@@ -122,5 +118,6 @@ async fn chat_reports_provider_error_status() {
         .arg("hello")
         .assert()
         .failure()
-        .stderr(contains("chat request failed with status 401"));
+        .stderr(contains("chat request failed with status 401"))
+        .stdout(is_empty());
 }

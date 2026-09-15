@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，没有修改生产代码，主要复盘了 `chat` 命令确定性 CLI 集成测试的设计意义。当前 `tests/chat_cli.rs` 使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。已覆盖 `chat` happy path、缺少 `llm.api_key`、provider 返回非 2xx status，以及 happy path 请求体中的 `model`、`temperature`、`messages` 和 `stream`。本次重点澄清了为什么自动化测试不应调用真实 LLM API、`chat.rs` / `config.rs` / `openai.rs` 的模块职责边界，以及 provider 错误路径中 stdout 为空断言对 CLI 用户契约的价值。`tests/chat_cli.rs` 的格式清理和 provider 错误路径 stdout 断言仍是下一步。
+最近一次学习中，围绕 `chat` CLI 集成测试完成了收尾。当前 `tests/chat_cli.rs` 使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。已覆盖 `chat` happy path、缺少 `llm.api_key`、provider 返回非 2xx status、happy path 请求体中的 `model`、`temperature`、`messages` 和 `stream`，并明确断言成功路径 `stderr` 为空、错误路径 `stdout` 为空。本次重点澄清了 CLI 用户契约、确定性测试、测试 helper 抽取边界、`chat.rs` / `config.rs` / `openai.rs` / `main.rs` 的错误职责边界，以及 `Option<String>` 和返回 owned `String` 背后的所有权原因。下一步继续围绕 `parse_chat_response` 的返回值所有权、引用返回条件和错误边界做小复盘。
 
 ## Completed
 
@@ -118,12 +118,24 @@
 - 理解 `chat.rs`、`config.rs`、`openai.rs` 的职责边界
 - 理解 `wiremock` 让 `chat` CLI 集成测试不依赖真实网络、真实 API key、provider 可用性、余额、限流或模型行为变化
 - 理解 provider 错误路径断言 stdout 为空是在保护 CLI 用户输出契约
+- 为 `chat` happy path 添加 `stderr` 为空断言
+- 为 `chat` 缺少 `llm.api_key` 错误路径添加 `stdout` 为空断言
+- 为 `chat` provider 非 2xx 错误路径添加 `stdout` 为空断言
+- 在 `tests/chat_cli.rs` 中抽取 `write_temp_config(contents)` helper
+- 理解测试 helper 应隐藏机械准备步骤，而不是隐藏测试意图
+- 理解成功路径和失败路径的 stdout / stderr / exit code 契约
+- 理解配置合法性和命令运行前置条件不是同一件事
+- 理解空 `model` 属于配置通用非法状态，而空 `api_key` 是 `chat` 命令运行前置条件
+- 理解 `Option<String>` 用于表达 provider 响应字段可能缺失或为 `null`
+- 初步理解从借用结构中取出 owned `String` 时为什么需要 `.clone()` 或其他所有权处理
 - 理解 `mod openai;` 是将 `src/openai.rs` 加入 crate 模块树
 - 初步讨论 `reqwest::Client` 当前函数内创建与未来 Agent Runtime 复用的取舍
 - 理解自动化测试不应直接调用真实 LLM API
 - 理解 `cargo test --test chat_cli` 中测试 target 名不包含 `.rs`
 - 理解 `Command::cargo_bin(...)` 的 binary 名应匹配 Cargo package/bin 名
 - 当前 `cargo check` 通过
+- 当前 `cargo fmt --check` 通过
+- 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
 - 当前 `cargo test --test chat_cli` 通过，3 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
@@ -196,19 +208,26 @@
 - CLI 集成测试与单元测试的分工
 - HTTP request body matcher
 - `reqwest::Client` 复用边界
+- CLI 用户契约
+- 测试 helper 抽取边界
+- 配置合法性 vs 命令运行前置条件
+- provider 协议边界
+- `Option<String>`
+- owned `String` vs `&str`
+- 从借用结构中移动字段的所有权限制
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约。
 
 ## Next Step
 
-下一步围绕 `chat` CLI 集成测试收尾并进入下一个小目标：
+下一步继续围绕 `openai.rs` 的响应解析、错误边界和 Rust 所有权做小复盘：
 
-- 清理 `tests/chat_cli.rs` 的字符串缩进、import 顺序、多余空行和格式细节
-- 判断并实现 provider 错误路径 stdout 为空的断言
-- 复盘当前 `chat` 测试覆盖，确认可以停止继续堆测试
-- 准备进入下一个小目标：继续围绕 CLI 用户契约、错误边界和模块职责推进
+- 回答 `first_word(input: &str) -> &str` 为什么可以返回引用
+- 复盘 `parse_chat_response(text: &str) -> Result<String>` 为什么返回 owned `String`
+- 对比 `Option<String>`、`.clone()`、`.as_ref()` 在当前代码中的取舍
+- 视情况运行 `cargo check` 和相关测试，确认当前改动状态
 
-优先学习目标仍然是 CLI 用户契约、确定性测试、错误输出边界和 async HTTP 行为，而不是继续扩展 Agent 功能。
+优先学习目标仍然是 CLI 用户契约、确定性测试、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
 
 ## Architecture Notes
 
@@ -283,7 +302,7 @@ temperature = 0.7
 ## Technical Debt
 
 - `PROJECT_STATUS.md` 实际位于 `journal/PROJECT_STATUS.md`，不是仓库根目录
-- `tests/chat_cli.rs` 当前存在可读性清理空间：JSON/TOML 缩进、import 顺序和空行格式
+- `tests/chat_cli.rs` 和 `src/openai.rs` 的测试 fixture 仍有轻微缩进可读性空间，但不影响当前学习主线
 - 当前日志文件命名存在 `2026-7-13.md` 这类非标准格式，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
@@ -293,7 +312,7 @@ temperature = 0.7
 
 ## Next TODO
 
-- [ ] 清理 `tests/chat_cli.rs` 的 TOML/JSON 缩进、import 顺序和空行格式
-- [ ] 判断并补充 `chat_reports_provider_error_status` 的 stdout 为空断言
-- [ ] 复盘当前 `chat` CLI 集成测试覆盖，确认可以进入下一个小目标
-- [ ] 继续讨论下一个 CLI/LLM 小目标，暂不提前扩展 Agent Runtime
+- [ ] 回答 `first_word(input: &str) -> &str` 为什么可以返回引用
+- [ ] 复盘 `parse_chat_response(text: &str) -> Result<String>` 为什么返回 `String` 而不是 `&str`
+- [ ] 对比 `Option<String>`、`.clone()`、`.as_ref()` 在当前代码中的取舍
+- [ ] 视情况运行 `cargo check` 和相关测试，确认当前改动状态
