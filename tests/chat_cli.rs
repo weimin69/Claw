@@ -4,7 +4,7 @@ use assert_cmd::Command;
 use predicates::str::{contains, is_empty};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, method, path},
+    matchers::{body_json, header, method, path},
 };
 
 fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {
@@ -19,6 +19,7 @@ async fn chat_prints_assistant_response_from_mock_server() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
         .and(body_json(serde_json::json!({
             "model": "test-model",
             "temperature": 0.7,

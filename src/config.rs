@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use std::env;
 
 #[derive(Debug, Deserialize)]
 pub struct LlmConfig {
@@ -37,8 +38,9 @@ pub fn load_config(path: &str) -> Result<Config> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path))?;
 
-    let config: Config = toml::from_str(&content).context("failed to parse config file")?;
+    let mut config: Config = toml::from_str(&content).context("failed to parse config file")?;
 
+    config.apply_env_defaults();
     config.validate()?;
 
     Ok(config)
@@ -57,6 +59,22 @@ fn default_temperature() -> f64 {
 }
 
 impl Config {
+    fn apply_env_defaults(&mut self) {
+        self.apply_env_defaults_with_api_key(env::var("AGENT_CLI_LLM_API_KEY").ok());
+    }
+
+    fn apply_env_defaults_with_api_key(&mut self, env_api_key: Option<String>) {
+        if !self.llm.api_key.trim().is_empty() {
+            return;
+        }
+
+        if let Some(api_key) = env_api_key {
+            if !api_key.trim().is_empty() {
+                self.llm.api_key = api_key;
+            }
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.llm.model.trim().is_empty() {
             bail!("model must not be empty");
@@ -207,6 +225,53 @@ temperature = "hot"
                 .to_string()
                 .contains("failed to read config file: missing-config-file.toml")
         );
+    }
+
+    #[test]
+    fn applies_env_api_key_when_api_key_is_missing() {
+        let mut config = Config {
+            llm: LlmConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: String::new(),
+                model: "test-model".to_string(),
+                temperature: 0.7,
+            },
+        };
+
+        config.apply_env_defaults_with_api_key(Some("env-key".to_string()));
+
+        assert_eq!(config.llm.api_key, "env-key");
+    }
+
+    #[test]
+    fn does_not_override_existing_api_key_with_env_api_key() {
+        let mut config = Config {
+            llm: LlmConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: "file-key".to_string(),
+                model: "test-model".to_string(),
+                temperature: 0.7,
+            },
+        };
+        config.apply_env_defaults_with_api_key(Some("env-key".to_string()));
+
+        assert_eq!(config.llm.api_key, "file-key");
+    }
+
+    #[test]
+    fn ignores_blank_env_api_key() {
+        let mut config = Config {
+            llm: LlmConfig {
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: String::new(),
+                model: "test-model".to_string(),
+                temperature: 0.7,
+            },
+        };
+
+        config.apply_env_defaults_with_api_key(Some("   ".to_string()));
+
+        assert_eq!(config.llm.api_key, "");
     }
 
     fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {

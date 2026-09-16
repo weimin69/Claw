@@ -84,10 +84,10 @@ fn parse_chat_response(text: &str) -> Result<String> {
     let content = choice
         .message
         .content
-        .clone()
+        .as_ref()
         .context("chat response choice did not contain message content")?;
 
-    Ok(content)
+    Ok(content.clone())
 }
 
 fn build_chat_request(model: String, temperature: f64, prompt: String) -> ChatRequest {

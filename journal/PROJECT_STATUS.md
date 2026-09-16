@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，围绕 `chat` CLI 集成测试完成了收尾。当前 `tests/chat_cli.rs` 使用 `wiremock` 提供本地 OpenAI-compatible mock server，使用 `tempfile::NamedTempFile` 写入临时 `[llm]` 配置，使用 `assert_cmd` 运行真实 CLI binary。已覆盖 `chat` happy path、缺少 `llm.api_key`、provider 返回非 2xx status、happy path 请求体中的 `model`、`temperature`、`messages` 和 `stream`，并明确断言成功路径 `stderr` 为空、错误路径 `stdout` 为空。本次重点澄清了 CLI 用户契约、确定性测试、测试 helper 抽取边界、`chat.rs` / `config.rs` / `openai.rs` / `main.rs` 的错误职责边界，以及 `Option<String>` 和返回 owned `String` 背后的所有权原因。下一步继续围绕 `parse_chat_response` 的返回值所有权、引用返回条件和错误边界做小复盘。
+最近一次学习中，围绕 `openai.rs` 响应解析、Rust 所有权、配置合并边界和 `chat` 请求契约完成了一轮小推进。当前 `parse_chat_response()` 使用 `.as_ref()` 先借用 `Option<String>` 中的内容，再在返回 `String` 时 `.clone()`，以更清楚地表达借用到 owned value 的转换。`tests/chat_cli.rs` 的 happy path 已断言 `Authorization: Bearer test-key` header，防止 `.bearer_auth(api_key)` 请求契约退化。`src/config.rs` 新增 `AGENT_CLI_LLM_API_KEY` 环境变量 fallback：当 TOML `llm.api_key` 为空时使用 env；TOML 显式 key 优先；空白 env key 会被忽略。配置合并规则已经通过单元测试覆盖，并避免直接在单元测试中修改真实进程环境变量。
 
 ## Completed
 
@@ -133,9 +133,20 @@
 - 理解自动化测试不应直接调用真实 LLM API
 - 理解 `cargo test --test chat_cli` 中测试 target 名不包含 `.rs`
 - 理解 `Command::cargo_bin(...)` 的 binary 名应匹配 Cargo package/bin 名
+- 复盘 `first_word(input: &str) -> &str` 能返回引用的原因：返回值借用自调用者仍然拥有的数据
+- 复盘生命周期标注只描述引用关系，不会延长局部变量生命周期
+- 将 `parse_chat_response()` 改为先 `.as_ref()` 借用 `Option<String>`，再 `.clone()` 返回 owned `String`
+- 理解 `parse_chat_response()` 中非法 JSON、空 `choices`、缺失 `content` 是三个不同错误边界
+- 为 `chat` happy path CLI 集成测试添加 `Authorization: Bearer test-key` header 断言
+- 支持通过 `AGENT_CLI_LLM_API_KEY` 为 LLM API key 提供环境变量 fallback
+- 明确 TOML 中显式 `llm.api_key` 优先于环境变量 fallback
+- 明确空字符串或全空格环境变量不应写入 `llm.api_key`
+- 将真实环境变量读取和配置合并规则拆开，避免单元测试污染进程全局环境
+- 为配置合并规则添加单元测试：缺失 key 时使用 env、已有 TOML key 时不覆盖、空白 env key 被忽略
 - 当前 `cargo check` 通过
 - 当前 `cargo fmt --check` 通过
 - 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
+- 当前 `cargo test config` 通过，13 个配置相关测试全部通过
 - 当前 `cargo test --test chat_cli` 通过，3 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
@@ -215,19 +226,24 @@
 - `Option<String>`
 - owned `String` vs `&str`
 - 从借用结构中移动字段的所有权限制
+- `std::env::var`
+- 环境变量 fallback
+- 配置来源优先级
+- 外部状态读取与纯配置合并逻辑拆分
+- 进程全局环境变量对并发测试的影响
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约，以及 happy path 的 Authorization header 请求契约。
 
 ## Next Step
 
-下一步继续围绕 `openai.rs` 的响应解析、错误边界和 Rust 所有权做小复盘：
+下一步继续为 LLM API key 环境变量 fallback 补齐端到端 CLI 集成测试，并复盘配置来源优先级：
 
-- 回答 `first_word(input: &str) -> &str` 为什么可以返回引用
-- 复盘 `parse_chat_response(text: &str) -> Result<String>` 为什么返回 owned `String`
-- 对比 `Option<String>`、`.clone()`、`.as_ref()` 在当前代码中的取舍
-- 视情况运行 `cargo check` 和相关测试，确认当前改动状态
+- 为 `chat` 添加“配置文件不写 `api_key`，但 `AGENT_CLI_LLM_API_KEY` 存在时仍可成功请求”的 CLI 集成测试
+- 确认该集成测试不会污染其他测试中的环境变量状态
+- 复盘为什么环境变量 fallback 属于 `config.rs` 边界，而不是 `openai.rs` 边界
+- 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai` 和 `cargo test --test chat_cli`
 
-优先学习目标仍然是 CLI 用户契约、确定性测试、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
+优先学习目标仍然是 CLI 用户契约、确定性测试、配置边界、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
 
 ## Architecture Notes
 
@@ -262,7 +278,7 @@
 - `src/cli.rs`：定义 CLI 结构和子命令，不写业务逻辑
 - `src/commands/`：每个命令一个文件，负责具体命令行为
 - `src/commands/mod.rs`：统一导出命令模块
-- `src/config.rs`：定义配置模型、默认值、业务校验和 `load_config(path)`
+- `src/config.rs`：定义配置模型、默认值、环境变量 fallback、业务校验和 `load_config(path)`
 - `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
@@ -273,7 +289,7 @@
 ```toml
 [llm]
 base_url = "https://api.deepseek.com"
-api_key = "..."
+api_key = "..." # 可省略；为空时回退到 AGENT_CLI_LLM_API_KEY
 model = "deepseek-v4-pro"
 temperature = 0.7
 ```
@@ -292,12 +308,11 @@ temperature = 0.7
 - `send_chat_request()` 是否应该继续在函数内创建新的 `reqwest::Client`，还是等 Agent runtime 阶段再引入 client 复用？
 - `fetch --max-chars` 是否需要增加上限，避免用户意外读取和输出过大的 preview？
 - 非 2xx status 是否只输出 status 足够，还是需要后续通过 `--verbose` 暴露 provider 错误 body？
-- `chat` 命令是否应支持从环境变量读取 API key？
 - `chat` 命令是否应支持 stdin 输入 prompt？
-- `chat` 是否还需要断言 Authorization header？
 - 是否需要继续为更多命令增加集成测试？
 - 是否需要将 `parse_chat_response()` 暴露为更明确的模块边界，还是保持私有函数？
 - 是否需要将 LLM provider 配置与通用 CLI 配置进一步分层？
+- 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
 
 ## Technical Debt
 
@@ -312,7 +327,7 @@ temperature = 0.7
 
 ## Next TODO
 
-- [ ] 回答 `first_word(input: &str) -> &str` 为什么可以返回引用
-- [ ] 复盘 `parse_chat_response(text: &str) -> Result<String>` 为什么返回 `String` 而不是 `&str`
-- [ ] 对比 `Option<String>`、`.clone()`、`.as_ref()` 在当前代码中的取舍
-- [ ] 视情况运行 `cargo check` 和相关测试，确认当前改动状态
+- [ ] 为 `chat` 添加 env API key fallback 的 CLI 集成测试
+- [ ] 确认 env fallback 集成测试不会污染 `chat_rejects_missing_api_key`
+- [ ] 复盘配置来源优先级：TOML 显式配置优先，env 只作为 fallback
+- [ ] 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai`、`cargo test --test chat_cli`
