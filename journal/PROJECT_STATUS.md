@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，围绕 `openai.rs` 响应解析、Rust 所有权、配置合并边界和 `chat` 请求契约完成了一轮小推进。当前 `parse_chat_response()` 使用 `.as_ref()` 先借用 `Option<String>` 中的内容，再在返回 `String` 时 `.clone()`，以更清楚地表达借用到 owned value 的转换。`tests/chat_cli.rs` 的 happy path 已断言 `Authorization: Bearer test-key` header，防止 `.bearer_auth(api_key)` 请求契约退化。`src/config.rs` 新增 `AGENT_CLI_LLM_API_KEY` 环境变量 fallback：当 TOML `llm.api_key` 为空时使用 env；TOML 显式 key 优先；空白 env key 会被忽略。配置合并规则已经通过单元测试覆盖，并避免直接在单元测试中修改真实进程环境变量。
+最近一次学习中，继续围绕 `chat` 的 API key 配置边界、CLI 集成测试和 HTTP client 生命周期完成了一轮推进。`tests/chat_cli.rs` 新增 env fallback 集成测试：当配置文件不写 `llm.api_key`，但 `AGENT_CLI_LLM_API_KEY` 通过 `assert_cmd` 子进程环境提供时，`chat` 仍可成功请求 mock server，并断言 `Authorization: Bearer env-key`。这验证了 env fallback 从 `config.rs` 进入命令层，再进入 OpenAI-compatible HTTP 请求契约。也复盘了当前 `send_chat_request()` 内部创建 `reqwest::Client` 的取舍：当前一次 CLI 调用只发一次请求，可以保持简单；未来 Agent Runtime 出现多次 LLM 调用时，再引入更长生命周期的 LLM client。
 
 ## Completed
 
@@ -143,11 +143,18 @@
 - 明确空字符串或全空格环境变量不应写入 `llm.api_key`
 - 将真实环境变量读取和配置合并规则拆开，避免单元测试污染进程全局环境
 - 为配置合并规则添加单元测试：缺失 key 时使用 env、已有 TOML key 时不覆盖、空白 env key 被忽略
+- 为 `chat` 添加 env API key fallback 的 CLI 集成测试
+- 理解 `cmd.env(...)` 只影响当前被测 CLI 子进程，避免污染当前测试进程的全局环境变量
+- 理解 env fallback 集成测试中配置文件必须省略 `api_key`，否则会退化为普通 happy path
+- 为 env fallback 集成测试断言 `Authorization: Bearer env-key`，证明环境变量结果进入真实 HTTP 请求契约
+- 复盘 stdout、stderr 和 Authorization header 分别保护用户结果契约、错误/诊断契约和 provider 请求契约
+- 复盘当前 `send_chat_request()` 内部创建 `reqwest::Client` 的设计取舍
+- 明确当前阶段暂不提前抽象 `LlmClient`，未来 Agent Runtime 多次调用 LLM 时再考虑 client 复用
 - 当前 `cargo check` 通过
 - 当前 `cargo fmt --check` 通过
 - 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
 - 当前 `cargo test config` 通过，13 个配置相关测试全部通过
-- 当前 `cargo test --test chat_cli` 通过，3 个 `chat` CLI 集成测试全部通过
+- 当前 `cargo test --test chat_cli` 通过，4 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
 
@@ -231,16 +238,20 @@
 - 配置来源优先级
 - 外部状态读取与纯配置合并逻辑拆分
 - 进程全局环境变量对并发测试的影响
+- `assert_cmd::Command::env`
+- HTTP client 生命周期
+- `reqwest::Client` 复用边界
+- Agent Runtime 中 LLM client 的未来边界
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约，以及 happy path 的 Authorization header 请求契约。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约、配置文件 API key 请求契约，以及 env fallback 的 Authorization header 请求契约。
 
 ## Next Step
 
-下一步继续为 LLM API key 环境变量 fallback 补齐端到端 CLI 集成测试，并复盘配置来源优先级：
+下一步先完成一次轻量复盘，再选择一个小而明确的 CLI/LLM 集成目标：
 
-- 为 `chat` 添加“配置文件不写 `api_key`，但 `AGENT_CLI_LLM_API_KEY` 存在时仍可成功请求”的 CLI 集成测试
-- 确认该集成测试不会污染其他测试中的环境变量状态
-- 复盘为什么环境变量 fallback 属于 `config.rs` 边界，而不是 `openai.rs` 边界
+- 复盘 `chat` 当前边界：`chat.rs`、`config.rs`、`openai.rs` 各自负责什么
+- 复盘当前为什么暂不把 `reqwest::Client` 提前抽到 `chat.rs` 或新的 `LlmClient`
+- 在以下方向中选择一个小目标：支持 `chat` 从 stdin 读取 prompt、整理 `openai.rs` 命名边界、继续补充 CLI 集成测试
 - 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai` 和 `cargo test --test chat_cli`
 
 优先学习目标仍然是 CLI 用户契约、确定性测试、配置边界、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
@@ -327,7 +338,7 @@ temperature = 0.7
 
 ## Next TODO
 
-- [ ] 为 `chat` 添加 env API key fallback 的 CLI 集成测试
-- [ ] 确认 env fallback 集成测试不会污染 `chat_rejects_missing_api_key`
-- [ ] 复盘配置来源优先级：TOML 显式配置优先，env 只作为 fallback
+- [ ] 复盘 `chat.rs`、`config.rs`、`openai.rs` 的职责边界
+- [ ] 决定下一步是否支持 `chat` 从 stdin 读取 prompt
+- [ ] 决定是否继续保留 `src/openai.rs` 命名，或等 LLM 边界更清楚后再调整
 - [ ] 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai`、`cargo test --test chat_cli`
