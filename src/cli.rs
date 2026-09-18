@@ -48,7 +48,7 @@ pub enum Commands {
     },
     Chat {
         config_path: String,
-        prompt: String,
+        prompt: Option<String>,
     },
 }
 fn parse_positive_usize(value: &str) -> Result<usize, String> {

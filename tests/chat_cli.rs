@@ -177,3 +177,114 @@ async fn chat_uses_env_api_key_when_config_api_key_is_missing() {
         .stdout(contains("Hello from mock assistant(env-key)"))
         .stderr(is_empty());
 }
+
+#[tokio::test]
+async fn chat_prefers_argument_prompt_over_stdin() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(body_json(serde_json::json!({
+            "model": "test-model",
+            "temperature": 0.7,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "from argument"
+                }
+            ],
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{
+                "choices": [
+                    {
+                        "message": {
+                            "content": "mock assistant content"
+                        }
+                    }
+                ]
+            }"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let config_file = write_temp_config(&format!(
+        r#"[llm]
+    base_url = "{}"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+        server.uri()
+    ));
+
+    let config_path = config_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    cmd.arg("chat")
+        .arg(config_path)
+        .arg("from argument")
+        .write_stdin("from stdin")
+        .assert()
+        .success()
+        .stderr(is_empty())
+        .stdout(contains("mock assistant content"));
+}
+
+#[tokio::test]
+async fn chat_with_prompt_from_stdin() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(body_json(serde_json::json!({
+            "model": "test-model",
+            "temperature": 0.7,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hello from stdin"
+                }
+            ],
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{
+                "choices": [
+                    {
+                        "message": {
+                            "content": "mock assistant content"
+                        }
+                    }
+                ]
+            }"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let config_file = write_temp_config(&format!(
+        r#"[llm]
+    base_url = "{}"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+        server.uri()
+    ));
+
+    let config_path = config_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    cmd.arg("chat")
+        .arg(config_path)
+        .write_stdin("hello from stdin")
+        .assert()
+        .success()
+        .stderr(is_empty())
+        .stdout(contains("mock assistant content"));
+}

@@ -1,6 +1,25 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::io::{Read, stdin};
 
-pub async fn execute(config_path: &str, prompt: &str) -> Result<()> {
+pub async fn execute(config_path: &str, prompt: Option<String>) -> Result<()> {
+    fn read_prompt_from_stdin() -> Result<String> {
+        let mut content = String::new();
+        let mut stdin = stdin();
+        stdin
+            .read_to_string(&mut content)
+            .context("failed to read prompt from stdin")?;
+
+        Ok(content)
+    }
+
+    let prompt = match prompt {
+        Some(value) => value,
+        None => read_prompt_from_stdin()?,
+    };
+    if prompt.trim().is_empty() {
+        bail!("prompt cannot be empty");
+    }
+
     let config = crate::config::load_config(config_path)?;
     let llm = config.llm;
 
@@ -13,7 +32,7 @@ pub async fn execute(config_path: &str, prompt: &str) -> Result<()> {
         &llm.api_key,
         llm.model,
         llm.temperature,
-        prompt.to_string(),
+        prompt,
     )
     .await?;
 

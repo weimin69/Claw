@@ -58,7 +58,7 @@ async fn run() -> Result<()> {
             config_path,
             prompt,
         } => {
-            commands::chat::execute(&config_path, &prompt).await?;
+            commands::chat::execute(&config_path, prompt).await?;
         }
     }
     Ok(())

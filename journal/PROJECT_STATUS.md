@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，继续围绕 `chat` 的 API key 配置边界、CLI 集成测试和 HTTP client 生命周期完成了一轮推进。`tests/chat_cli.rs` 新增 env fallback 集成测试：当配置文件不写 `llm.api_key`，但 `AGENT_CLI_LLM_API_KEY` 通过 `assert_cmd` 子进程环境提供时，`chat` 仍可成功请求 mock server，并断言 `Authorization: Bearer env-key`。这验证了 env fallback 从 `config.rs` 进入命令层，再进入 OpenAI-compatible HTTP 请求契约。也复盘了当前 `send_chat_request()` 内部创建 `reqwest::Client` 的取舍：当前一次 CLI 调用只发一次请求，可以保持简单；未来 Agent Runtime 出现多次 LLM 调用时，再引入更长生命周期的 LLM client。
+最近一次学习中，先复盘了 `chat.rs`、`config.rs`、`openai.rs` 和 `main.rs` 的职责边界，以及当前暂不提前抽象 `LlmClient` 的原因。随后为 `chat` 增加 stdin prompt fallback：CLI prompt 改为 `Option<String>`，显式命令行 prompt 优先，缺失时通过 `std::io::Read::read_to_string()` 读取 stdin，并在选择最终输入后统一拒绝空白 prompt。`tests/chat_cli.rs` 新增两个确定性集成测试，分别验证 stdin 内容进入真实 HTTP 请求体，以及命令行参数与 stdin 同时存在时参数优先。当前格式、编译和 6 个 `chat` CLI 集成测试全部通过；空白 prompt 的生产校验已实现，对应错误路径集成测试仍待补充。
 
 ## Completed
 
@@ -150,11 +150,22 @@
 - 复盘 stdout、stderr 和 Authorization header 分别保护用户结果契约、错误/诊断契约和 provider 请求契约
 - 复盘当前 `send_chat_request()` 内部创建 `reqwest::Client` 的设计取舍
 - 明确当前阶段暂不提前抽象 `LlmClient`，未来 Agent Runtime 多次调用 LLM 时再考虑 client 复用
+- 将 `chat` 的命令行 prompt 从 `String` 改为 `Option<String>`
+- 支持在命令行 prompt 缺失时从 stdin 读取 prompt
+- 明确命令行 prompt 与 stdin 同时存在时，显式命令行参数优先
+- 使用 `std::io::Read::read_to_string()` 将 stdin 读取到 owned `String`
+- 在输入来源选择后统一校验最终 prompt 不能为空或全为空白
+- 理解 stdin 是输入通道，prompt 是业务数据，两者并非同一概念
+- 理解 `match` 分支必须产生兼容类型，并使用 `?` 从 `Result<String>` 中取得值或传播错误
+- 理解 owned `String` 可以直接移动进请求结构，无需额外 `.to_string()`
+- 为 stdin prompt fallback 添加 CLI 集成测试并使用 `body_json` 验证请求体
+- 为命令行 prompt 优先于 stdin 添加 CLI 集成测试
+- 理解 wiremock 意外返回 404 通常表示请求 matcher 未命中
 - 当前 `cargo check` 通过
 - 当前 `cargo fmt --check` 通过
 - 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
 - 当前 `cargo test config` 通过，13 个配置相关测试全部通过
-- 当前 `cargo test --test chat_cli` 通过，4 个 `chat` CLI 集成测试全部通过
+- 当前 `cargo test --test chat_cli` 通过，6 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
 
@@ -242,16 +253,22 @@
 - HTTP client 生命周期
 - `reqwest::Client` 复用边界
 - Agent Runtime 中 LLM client 的未来边界
+- stdin 与命令行参数的输入优先级
+- `std::io::Read`
+- `stdin()`
+- `read_to_string()`
+- 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前读取 `[llm]` 配置，校验 API key 非空，调用 `openai::send_chat_request()`，并输出 assistant 的文本回复。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试当前使用 mock server 和临时配置文件，不依赖真实 LLM API，并已经明确覆盖成功和失败路径的 stdout / stderr 用户契约、配置文件 API key 请求契约，以及 env fallback 的 Authorization header 请求契约。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback，以及命令行参数优先级。
 
 ## Next Step
 
-下一步先完成一次轻量复盘，再选择一个小而明确的 CLI/LLM 集成目标：
+下一步先完成 stdin prompt 的错误路径测试，再决定后续小目标：
 
-- 复盘 `chat` 当前边界：`chat.rs`、`config.rs`、`openai.rs` 各自负责什么
-- 复盘当前为什么暂不把 `reqwest::Client` 提前抽到 `chat.rs` 或新的 `LlmClient`
-- 在以下方向中选择一个小目标：支持 `chat` 从 stdin 读取 prompt、整理 `openai.rs` 命名边界、继续补充 CLI 集成测试
+- 为仅包含空白的 stdin 添加 CLI 集成测试
+- 为仅包含空白的命令行 prompt 添加 CLI 集成测试
+- 复盘同步 stdin 读取在当前一次性 CLI 中为何可接受，以及交互式 Agent Runtime 阶段可能需要怎样调整
+- 完成输入契约后，再选择整理 `openai.rs` 命名边界或继续补充其他 CLI 集成测试
 - 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai` 和 `cargo test --test chat_cli`
 
 优先学习目标仍然是 CLI 用户契约、确定性测试、配置边界、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
@@ -287,13 +304,13 @@
 当前职责划分：
 
 - `src/cli.rs`：定义 CLI 结构和子命令，不写业务逻辑
-- `src/commands/`：每个命令一个文件，负责具体命令行为
+- `src/commands/`：每个命令一个文件，负责具体命令行为；`chat.rs` 也负责选择命令行 prompt 或 stdin，并校验最终 prompt
 - `src/commands/mod.rs`：统一导出命令模块
 - `src/config.rs`：定义配置模型、默认值、环境变量 fallback、业务校验和 `load_config(path)`
 - `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
-- `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界和请求体边界
+- `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback 和输入优先级
 
 配置格式当前为：
 
@@ -319,7 +336,7 @@ temperature = 0.7
 - `send_chat_request()` 是否应该继续在函数内创建新的 `reqwest::Client`，还是等 Agent runtime 阶段再引入 client 复用？
 - `fetch --max-chars` 是否需要增加上限，避免用户意外读取和输出过大的 preview？
 - 非 2xx status 是否只输出 status 足够，还是需要后续通过 `--verbose` 暴露 provider 错误 body？
-- `chat` 命令是否应支持 stdin 输入 prompt？
+- 当前同步读取 stdin 是否应在未来交互式 Agent Runtime 阶段迁移为 Tokio 异步 I/O？
 - 是否需要继续为更多命令增加集成测试？
 - 是否需要将 `parse_chat_response()` 暴露为更明确的模块边界，还是保持私有函数？
 - 是否需要将 LLM provider 配置与通用 CLI 配置进一步分层？
@@ -335,10 +352,10 @@ temperature = 0.7
 - 当前主要只有 `fetch` 和 `chat` 有 CLI 集成测试，其他命令暂未覆盖
 - `src/openai.rs` 名称和“支持所有 OpenAI-compatible provider”的目标不完全一致
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
+- 空白 stdin 和空白命令行 prompt 的错误路径尚未添加 CLI 集成测试
 
 ## Next TODO
 
-- [ ] 复盘 `chat.rs`、`config.rs`、`openai.rs` 的职责边界
-- [ ] 决定下一步是否支持 `chat` 从 stdin 读取 prompt
-- [ ] 决定是否继续保留 `src/openai.rs` 命名，或等 LLM 边界更清楚后再调整
-- [ ] 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai`、`cargo test --test chat_cli`
+- [ ] 为仅包含空白的 stdin 添加 CLI 集成测试
+- [ ] 为仅包含空白的命令行 prompt 添加 CLI 集成测试
+- [ ] 复盘同步 stdin 与异步 Agent Runtime 的边界
