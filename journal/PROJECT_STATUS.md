@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，先复盘了 `chat.rs`、`config.rs`、`openai.rs` 和 `main.rs` 的职责边界，以及当前暂不提前抽象 `LlmClient` 的原因。随后为 `chat` 增加 stdin prompt fallback：CLI prompt 改为 `Option<String>`，显式命令行 prompt 优先，缺失时通过 `std::io::Read::read_to_string()` 读取 stdin，并在选择最终输入后统一拒绝空白 prompt。`tests/chat_cli.rs` 新增两个确定性集成测试，分别验证 stdin 内容进入真实 HTTP 请求体，以及命令行参数与 stdin 同时存在时参数优先。当前格式、编译和 6 个 `chat` CLI 集成测试全部通过；空白 prompt 的生产校验已实现，对应错误路径集成测试仍待补充。
+最近一次学习中，为 `chat` 补齐了空白 prompt 的错误路径契约。`tests/chat_cli.rs` 新增两个确定性集成测试，分别验证仅包含空白的命令行 prompt 和 stdin prompt 都会返回失败状态、保持 stdout 为空，并在 stderr 输出 `prompt cannot be empty`。同时复盘了输入来源选择与业务校验的区别，以及同步 stdin 在当前一次性顺序 CLI 中可以接受、但在未来需要并发、流式输出或取消的 Agent Runtime 中应重新评估的原因。当前格式、编译和两个新增测试均通过；`chat` CLI 集成测试总数为 8 个。
 
 ## Completed
 
@@ -160,12 +160,18 @@
 - 理解 owned `String` 可以直接移动进请求结构，无需额外 `.to_string()`
 - 为 stdin prompt fallback 添加 CLI 集成测试并使用 `body_json` 验证请求体
 - 为命令行 prompt 优先于 stdin 添加 CLI 集成测试
+- 为仅包含空白的命令行 prompt 添加 CLI 集成测试
+- 为仅包含空白的 stdin prompt 添加 CLI 集成测试
+- 理解输入来源选择与最终 prompt 业务校验是两个不同步骤
+- 理解显式空白命令行参数不会静默回退到 stdin
+- 理解异步 I/O 的主要价值是在等待期间允许执行其他任务，而不是让单次 I/O 更快
+- 明确当前一次性 `chat` 流程继续同步读取 stdin，未来交互式 Agent Runtime 再评估异步 stdin
 - 理解 wiremock 意外返回 404 通常表示请求 matcher 未命中
 - 当前 `cargo check` 通过
 - 当前 `cargo fmt --check` 通过
 - 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
 - 当前 `cargo test config` 通过，13 个配置相关测试全部通过
-- 当前 `cargo test --test chat_cli` 通过，6 个 `chat` CLI 集成测试全部通过
+- 当前两个新增空白 prompt CLI 集成测试通过；`chat` CLI 集成测试总数为 8 个
 
 ## In Progress
 
@@ -259,16 +265,16 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback，以及命令行参数优先级。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback、命令行参数优先级，以及两种输入来源的空白 prompt 错误路径。
 
 ## Next Step
 
-下一步先完成 stdin prompt 的错误路径测试，再决定后续小目标：
+下一步讨论 `openai.rs` 的命名边界，不立即实施重构：
 
-- 为仅包含空白的 stdin 添加 CLI 集成测试
-- 为仅包含空白的命令行 prompt 添加 CLI 集成测试
-- 复盘同步 stdin 读取在当前一次性 CLI 中为何可接受，以及交互式 Agent Runtime 阶段可能需要怎样调整
-- 完成输入契约后，再选择整理 `openai.rs` 命名边界或继续补充其他 CLI 集成测试
+- 列出 `src/openai.rs` 当前承担的职责
+- 比较保持 `openai.rs`、重命名为 `llm.rs`、拆分为 `llm/openai_compatible.rs` 的语义和维护成本
+- 根据当前只有一种协议实现的事实，判断现在重命名是否有实际收益
+- 如果决定保持现状，将触发未来重构的条件记录清楚
 - 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai` 和 `cargo test --test chat_cli`
 
 优先学习目标仍然是 CLI 用户契约、确定性测试、配置边界、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
@@ -310,7 +316,7 @@
 - `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
-- `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback 和输入优先级
+- `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
 
 配置格式当前为：
 
@@ -352,10 +358,9 @@ temperature = 0.7
 - 当前主要只有 `fetch` 和 `chat` 有 CLI 集成测试，其他命令暂未覆盖
 - `src/openai.rs` 名称和“支持所有 OpenAI-compatible provider”的目标不完全一致
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
-- 空白 stdin 和空白命令行 prompt 的错误路径尚未添加 CLI 集成测试
 
 ## Next TODO
 
-- [ ] 为仅包含空白的 stdin 添加 CLI 集成测试
-- [ ] 为仅包含空白的命令行 prompt 添加 CLI 集成测试
-- [ ] 复盘同步 stdin 与异步 Agent Runtime 的边界
+- [ ] 列出 `src/openai.rs` 当前职责与边界
+- [ ] 比较三个模块命名方案及其 trade-off
+- [ ] 决定是否需要现在重命名，或记录为后续重构项

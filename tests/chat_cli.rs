@@ -288,3 +288,49 @@ async fn chat_with_prompt_from_stdin() {
         .stderr(is_empty())
         .stdout(contains("mock assistant content"));
 }
+
+#[test]
+fn chat_rejects_whitespace_argument_prompt() {
+    let config_file = write_temp_config(
+        r#"[llm]
+    base_url = "https://127.0.0.1:1"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+    );
+    let config_path = config_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    cmd.arg("chat")
+        .arg(config_path)
+        .arg(" ")
+        .assert()
+        .failure()
+        .stderr(contains("prompt cannot be empty"))
+        .stdout(is_empty());
+}
+
+#[test]
+fn chat_rejects_whitespace_stdin_prompt() {
+    let config_file = write_temp_config(
+        r#"[llm]
+    base_url = "https://127.0.0.1:1"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+    );
+    let config_path = config_file.path().to_str().unwrap();
+
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    cmd.write_stdin(" \n\t")
+        .arg("chat")
+        .arg(config_path)
+        .assert()
+        .failure()
+        .stderr(contains("prompt cannot be empty"))
+        .stdout(is_empty());
+}
