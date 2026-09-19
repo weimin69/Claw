@@ -1,0 +1,44 @@
+Claw agent
+==========
+A terminal-based agent(Development phase)
+
+Currently implemented features
+------------------------------
+* chat <config> <promtp>  -- Interact with a large language model once
+* hello <name> <age>  -- Stdout your name and age
+* sum Vec<number> -- Calculate the sum of multiple numbers
+* repeat <content> -- Repeat your content
+* version -- Stdout the Claw version
+* wait <number> -- Wait a few seconds
+* read-config <config.toml> -- Read the current configuration and output it
+* divide <number> <number*> -- Divide the two numbers
+* fetch <website> -- fetch the head of the website
+
+Additional information
+----------------------
+* openai.rs -- This file extends the functionality of the chat.rs to support API processing
+* test ------ chat_cli.rs -- Integration testing of the chat function
+          |
+          |
+          --- fetch_cli.rs -- Integration testing of the fetch function
+* mod.rs -- Exporting all commands is outdated; for simplicity, we'll continue using mod. In fact, the lib is the better choice
+* config.rs -- Enter the LLM configuration here
+* cli.rs -- Handle the execution of all commands
+* main.rs -- Main entry point also handles errors
+
+How to use it currently
+-----------------------
+You need to have the Rust compiler and the Cargo package manager
+Clone this repository to your local machine
+Use "cargo run command <parameter>" to debug this program; dependencies will be downloaded upon the first run, so there is no need to worry
+You can use "cargo test" to run tests; these include both unit tests and integration tests
+
+How to get involved in development
+-----------------------------------
+Feel free to submit Issues if you encounter any bugs or have any questions
+You can contribute to this project by forking the repository and submitting a branch; however, please contact me before making any contributions.
+My email address is listed on the homepage
+
+Future expectations for this repository
+---------------------------------------
+I will continue to maintain this repository; my goal is to build a product with capabilities comparable to Codex or Grokbuild.
