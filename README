@@ -12,7 +12,7 @@ Currently implemented features
 * wait <number> -- Wait a few seconds
 * read-config <config.toml> -- Read the current configuration and output it
 * divide <number> <number*> -- Divide the two numbers
-* fetch <website> -- fetch the head of the website
+* fetch <website> -- Fetch the head of the website
 * journal -- In the journal folder, there are explanations about the other files.
 
 Additional information
