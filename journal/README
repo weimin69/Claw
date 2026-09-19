@@ -1,0 +1,13 @@
+Sharing My Personal Development Experience
+==========================================
+I use an AI agent to help me complete this project, but it’s not traditional web coding. I have the AI teach me and guide me through finishing the project
+
+-------------------
+I created three files: AGENTS.md, status.md, and learning_map.md.
+
+* The first one defines the role of the LLM—telling it what it can and cannot do, and how it should teach me to complete the project.
+* The second one is read by the AI at the start and end of every development session, so it knows what I did last time and what I should do this time, ensuring continuity in my learning.
+* The third one is the overall development roadmap, so the AI doesn’t stray from the main path.
+
+-------------------
+There’s also a journal folder where I write a summary after each development session. This helps me keep records and remember what I was working on at the time
