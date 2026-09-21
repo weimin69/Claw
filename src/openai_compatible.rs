@@ -1,3 +1,5 @@
+//! Client behavior for the OpenAI-compatible Chat Completions protocol.
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 

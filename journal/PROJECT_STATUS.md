@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，为 `chat` 补齐了空白 prompt 的错误路径契约。`tests/chat_cli.rs` 新增两个确定性集成测试，分别验证仅包含空白的命令行 prompt 和 stdin prompt 都会返回失败状态、保持 stdout 为空，并在 stderr 输出 `prompt cannot be empty`。同时复盘了输入来源选择与业务校验的区别，以及同步 stdin 在当前一次性顺序 CLI 中可以接受、但在未来需要并发、流式输出或取消的 Agent Runtime 中应重新评估的原因。当前格式、编译和两个新增测试均通过；`chat` CLI 集成测试总数为 8 个。
+最近一次学习中，完成了 OpenAI-compatible 协议模块的命名边界讨论，并将 `src/openai.rs` 重命名为 `src/openai_compatible.rs`。明确了 Provider 数量增加不等于协议数量增加，当前无需提前创建 `llm/` 目录、Provider trait 或进一步拆分配置；`parse_chat_response()` 继续保持私有。还复盘了 `reqwest::Client` 复用、Provider 错误输出、response body 资源限制、风险驱动测试、`?`、`.await` 和 wiremock matcher 边界。当前格式、编译、7 个协议单元测试、13 个配置测试和 8 个 `chat` CLI 集成测试均通过。
 
 ## Completed
 
@@ -167,11 +167,20 @@
 - 理解异步 I/O 的主要价值是在等待期间允许执行其他任务，而不是让单次 I/O 更快
 - 明确当前一次性 `chat` 流程继续同步读取 stdin，未来交互式 Agent Runtime 再评估异步 stdin
 - 理解 wiremock 意外返回 404 通常表示请求 matcher 未命中
+- 将 `src/openai.rs` 重命名为 `src/openai_compatible.rs`，准确表达多个 Provider 可复用的协议边界
+- 明确 Provider 数量增加不等于协议实现数量增加
+- 明确当前只有一种协议实现，不创建 `llm/` 目录或 Provider trait
+- 明确传入具体 `reqwest::Client` 可以集中配置和复用连接，但不会自动使网络层可 mock
+- 明确当一次进程或 Agent run 需要多次调用 LLM 时，再重新评估 Client 生命周期
+- 明确默认错误输出不应直接暴露 Provider 原始 body，未来 verbose 输出也需要截断和脱敏
+- 区分 `fetch --max-chars` 的终端输出限制与 response body 的资源限制
+- 理解 wiremock 返回 404 通常表示请求到达 mock server 但 matcher 未命中
+- 明确当前 `LlmConfig` 无需进一步分层，`parse_chat_response()` 保持私有
 - 当前 `cargo check` 通过
 - 当前 `cargo fmt --check` 通过
-- 当前 `cargo test openai` 通过，7 个 `openai` 单元测试全部通过
+- 当前 `cargo test openai_compatible` 通过，7 个协议单元测试全部通过
 - 当前 `cargo test config` 通过，13 个配置相关测试全部通过
-- 当前两个新增空白 prompt CLI 集成测试通过；`chat` CLI 集成测试总数为 8 个
+- 当前 `cargo test --test chat_cli` 通过，8 个 `chat` CLI 集成测试全部通过
 
 ## In Progress
 
@@ -265,19 +274,19 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback、命令行参数优先级，以及两种输入来源的空白 prompt 错误路径。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai_compatible::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback、命令行参数优先级，以及两种输入来源的空白 prompt 错误路径。
 
 ## Next Step
 
-下一步讨论 `openai.rs` 的命名边界，不立即实施重构：
+下一步进入 Async Rust 的 Tokio Task 与并发学习，先讨论并确定一个最小开发练习：
 
-- 列出 `src/openai.rs` 当前承担的职责
-- 比较保持 `openai.rs`、重命名为 `llm.rs`、拆分为 `llm/openai_compatible.rs` 的语义和维护成本
-- 根据当前只有一种协议实现的事实，判断现在重命名是否有实际收益
-- 如果决定保持现状，将触发未来重构的条件记录清楚
-- 视情况运行 `cargo fmt --check`、`cargo check`、`cargo test config`、`cargo test openai` 和 `cargo test --test chat_cli`
+- 选择一个与未来 Agent 并行工具执行相关、但范围足够小的并发场景
+- 明确任务输入、输出顺序、错误传播和失败策略
+- 理解 task 的创建、等待和生命周期
+- 继续使用确定性测试验证并发行为，不依赖真实外部服务
+- 由开发者完成主要生产代码，AI 负责讲解、拆解、提示和代码审查
 
-优先学习目标仍然是 CLI 用户契约、确定性测试、配置边界、错误输出边界、Rust 所有权和 async HTTP 行为，而不是继续扩展 Agent 功能。
+优先学习目标是一次只引入一个主要 Async Rust 概念；暂不直接构建完整 Agent Loop，也不提前引入 channel、Provider trait 或大型运行时抽象。
 
 ## Architecture Notes
 
@@ -289,7 +298,7 @@
 │   ├── cli.rs
 │   ├── config.rs
 │   ├── main.rs
-│   ├── openai.rs
+│   ├── openai_compatible.rs
 │   └── commands/
 │       ├── chat.rs
 │       ├── divide.rs
@@ -313,7 +322,7 @@
 - `src/commands/`：每个命令一个文件，负责具体命令行为；`chat.rs` 也负责选择命令行 prompt 或 stdin，并校验最终 prompt
 - `src/commands/mod.rs`：统一导出命令模块
 - `src/config.rs`：定义配置模型、默认值、环境变量 fallback、业务校验和 `load_config(path)`
-- `src/openai.rs`：当前负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
+- `src/openai_compatible.rs`：负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
@@ -338,29 +347,26 @@ temperature = 0.7
 
 ## Open Questions
 
-- `src/openai.rs` 是否应重命名为 `src/llm.rs` 或 `src/llm/openai_compatible.rs`？
 - `send_chat_request()` 是否应该继续在函数内创建新的 `reqwest::Client`，还是等 Agent runtime 阶段再引入 client 复用？
 - `fetch --max-chars` 是否需要增加上限，避免用户意外读取和输出过大的 preview？
 - 非 2xx status 是否只输出 status 足够，还是需要后续通过 `--verbose` 暴露 provider 错误 body？
 - 当前同步读取 stdin 是否应在未来交互式 Agent Runtime 阶段迁移为 Tokio 异步 I/O？
 - 是否需要继续为更多命令增加集成测试？
-- 是否需要将 `parse_chat_response()` 暴露为更明确的模块边界，还是保持私有函数？
-- 是否需要将 LLM provider 配置与通用 CLI 配置进一步分层？
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
+- 下一个 Tokio Task 并发练习应选择什么最小场景，才能贴近未来 Agent 并行工具执行而不过度扩展功能？
 
 ## Technical Debt
 
 - `PROJECT_STATUS.md` 实际位于 `journal/PROJECT_STATUS.md`，不是仓库根目录
-- `tests/chat_cli.rs` 和 `src/openai.rs` 的测试 fixture 仍有轻微缩进可读性空间，但不影响当前学习主线
+- `tests/chat_cli.rs` 和 `src/openai_compatible.rs` 的测试 fixture 仍有轻微缩进可读性空间，但不影响当前学习主线
 - 当前日志文件命名存在 `2026-7-13.md` 这类非标准格式，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
 - 当前主要只有 `fetch` 和 `chat` 有 CLI 集成测试，其他命令暂未覆盖
-- `src/openai.rs` 名称和“支持所有 OpenAI-compatible provider”的目标不完全一致
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 
 ## Next TODO
 
-- [ ] 列出 `src/openai.rs` 当前职责与边界
-- [ ] 比较三个模块命名方案及其 trade-off
-- [ ] 决定是否需要现在重命名，或记录为后续重构项
+- [ ] 选择与 Agent 并行工具执行相关的最小并发练习
+- [ ] 明确并发任务的输入、输出顺序和错误策略
+- [ ] 学习 Tokio Task 的创建、等待和失败边界

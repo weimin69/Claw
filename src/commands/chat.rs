@@ -27,7 +27,7 @@ pub async fn execute(config_path: &str, prompt: Option<String>) -> Result<()> {
         bail!("missing llm api key");
     }
 
-    let text = crate::openai::send_chat_request(
+    let text = crate::openai_compatible::send_chat_request(
         &llm.base_url,
         &llm.api_key,
         llm.model,
