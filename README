@@ -14,6 +14,7 @@ Currently implemented features
 * divide <number> <number*> -- Divide the two numbers
 * fetch <website> -- Fetch the head of the website
 * journal -- In the journal folder, there are explanations about the other files.
+* parallel <first> <second> -- Asynchronous concurrent processing, with the shortest execution time.
 
 Additional information
 ----------------------
@@ -31,7 +32,7 @@ How to use it currently
 -----------------------
 You need to have the Rust compiler and the Cargo package manager
 Clone this repository to your local machine
-Use "cargo run command <parameter>" to debug this program; dependencies will be downloaded upon the first run, so there is no need to worry
+Use "cargo run  -- <command> <parameter>" to debug this program; dependencies will be downloaded upon the first run, so there is no need to worry
 You can use "cargo test" to run tests; these include both unit tests and integration tests
 
 How to get involved in development
