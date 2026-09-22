@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了 OpenAI-compatible 协议模块的命名边界讨论，并将 `src/openai.rs` 重命名为 `src/openai_compatible.rs`。明确了 Provider 数量增加不等于协议数量增加，当前无需提前创建 `llm/` 目录、Provider trait 或进一步拆分配置；`parse_chat_response()` 继续保持私有。还复盘了 `reqwest::Client` 复用、Provider 错误输出、response body 资源限制、风险驱动测试、`?`、`.await` 和 wiremock matcher 边界。当前格式、编译、7 个协议单元测试、13 个配置测试和 8 个 `chat` CLI 集成测试均通过。
+最近一次学习中，完成了 Tokio Task 与基础并发练习，新增 `parallel-wait` 命令，并使用两个 `tokio::spawn` Task 并发等待。明确了 `.await` 不会自动创建并发，Task 必须先创建再等待；同时区分了启动顺序、完成顺序、结果获取顺序和输出顺序。新增 CLI 集成测试保护输出与错误契约，并使用 Tokio 暂停时间和 timeout 确定性验证并发行为。当前格式、编译和完整测试套件均通过，共 36 个测试。
 
 ## Completed
 
@@ -181,6 +181,18 @@
 - 当前 `cargo test openai_compatible` 通过，7 个协议单元测试全部通过
 - 当前 `cargo test config` 通过，13 个配置相关测试全部通过
 - 当前 `cargo test --test chat_cli` 通过，8 个 `chat` CLI 集成测试全部通过
+- 新增 `parallel-wait <FIRST_SECONDS> <SECOND_SECONDS>` 命令
+- 使用两个 `tokio::spawn` Task 并发执行等待操作
+- 理解连续 `.await` 不会自动产生并发
+- 理解多个 Task 需要先创建再等待，生命周期才能重叠
+- 理解 `JoinHandle::await` 和 `JoinError` 的基础边界
+- 区分 Task 启动顺序、完成顺序、结果获取顺序和 CLI 输出顺序
+- 在 Task 创建前校验等待参数范围，避免失败后仍启动部分任务
+- 为 `parallel-wait` 添加成功输出顺序和非法输入 CLI 集成测试
+- 为 Tokio 启用 `test-util` feature
+- 使用 `#[tokio::test(start_paused = true)]` 和 timeout 确定性验证并发行为
+- 理解测试阈值必须能够区分并发实现和顺序回归
+- 当前 `cargo test` 通过，共 36 个测试
 
 ## In Progress
 
@@ -274,19 +286,19 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait::execute(seconds)`、`fetch::execute(url, max_chars)` 和 `chat::execute(config_path, prompt)` 是当前异步命令。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai_compatible::send_chat_request()` 并输出 assistant 文本。`config.rs` 当前会在 TOML `llm.api_key` 为空时读取 `AGENT_CLI_LLM_API_KEY` 作为 fallback。`chat` 的 CLI 集成测试使用 mock server 和临时配置文件，不依赖真实 LLM API，已覆盖成功和失败输出契约、配置文件与 env API key 请求契约、stdin fallback、命令行参数优先级，以及两种输入来源的空白 prompt 错误路径。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 先创建两个 Tokio Task，再依次等待结果，并由主流程按参数顺序输出；暂停时间测试使用 2.5 秒 timeout 区分 2 秒并发实现与 3 秒顺序回归。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai_compatible::send_chat_request()` 并输出 assistant 文本。
 
 ## Next Step
 
-下一步进入 Async Rust 的 Tokio Task 与并发学习，先讨论并确定一个最小开发练习：
+下一步继续深化 Tokio Task 的错误边界：
 
-- 选择一个与未来 Agent 并行工具执行相关、但范围足够小的并发场景
-- 明确任务输入、输出顺序、错误传播和失败策略
-- 理解 task 的创建、等待和生命周期
-- 继续使用确定性测试验证并发行为，不依赖真实外部服务
-- 由开发者完成主要生产代码，AI 负责讲解、拆解、提示和代码审查
+- 改进 `parallel-wait` 参数校验，使错误能指出具体非法参数
+- 让最小 Task 返回业务 `Result`，观察 `JoinHandle<Result<T, E>>` 的嵌套结果
+- 区分任务级 `JoinError` 与任务内部业务错误
+- 讨论一个任务失败时 fail-fast 与等待全部任务完成的取舍
+- 使用暂停时间继续编写确定性错误路径测试
 
-优先学习目标是一次只引入一个主要 Async Rust 概念；暂不直接构建完整 Agent Loop，也不提前引入 channel、Provider trait 或大型运行时抽象。
+继续一次只引入一个主要 Async Rust 概念；暂不引入 channel、取消机制、Provider trait 或完整 Agent Loop。
 
 ## Architecture Notes
 
@@ -305,6 +317,7 @@
 │       ├── echo.rs
 │       ├── fetch.rs
 │       ├── hello.rs
+│       ├── parallel_wait.rs
 │       ├── read_config.rs
 │       ├── repeat.rs
 │       ├── sum.rs
@@ -312,6 +325,7 @@
 │       ├── version.rs
 │       └── mod.rs
 └── tests/
+    ├── parallel_wait_cli.rs
     ├── fetch_cli.rs
     └── chat_cli.rs
 ```
@@ -326,6 +340,8 @@
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
+- `src/commands/parallel_wait.rs`：创建两个 Tokio Task 并发等待，按参数顺序收集和输出结果，并使用暂停时间测试并发时序
+- `tests/parallel_wait_cli.rs`：验证 `parallel-wait` 的成功输出顺序、失败退出码、stdout 和 stderr 契约
 
 配置格式当前为：
 
@@ -353,7 +369,8 @@ temperature = 0.7
 - 当前同步读取 stdin 是否应在未来交互式 Agent Runtime 阶段迁移为 Tokio 异步 I/O？
 - 是否需要继续为更多命令增加集成测试？
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
-- 下一个 Tokio Task 并发练习应选择什么最小场景，才能贴近未来 Agent 并行工具执行而不过度扩展功能？
+- 并发 Task 返回业务 `Result` 后，一个任务失败时应立即失败还是等待所有任务结束？
+- 后续是否需要显式取消仍在运行的兄弟 Task？
 
 ## Technical Debt
 
@@ -362,11 +379,12 @@ temperature = 0.7
 - 当前日志文件命名存在 `2026-7-13.md` 这类非标准格式，后续建议统一为 `YYYY-MM-DD.md`
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
-- 当前主要只有 `fetch` 和 `chat` 有 CLI 集成测试，其他命令暂未覆盖
+- 当前主要只有 `fetch`、`chat` 和 `parallel-wait` 有 CLI 集成测试，其他命令暂未覆盖
+- `parallel-wait` 当前将两个参数的校验合并处理，错误信息不能指出具体非法参数
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 
 ## Next TODO
 
-- [ ] 选择与 Agent 并行工具执行相关的最小并发练习
-- [ ] 明确并发任务的输入、输出顺序和错误策略
-- [ ] 学习 Tokio Task 的创建、等待和失败边界
+- [ ] 分别校验 `first_seconds` 与 `second_seconds` 并提供精确错误信息
+- [ ] 设计返回业务 `Result` 的 Task，区分业务错误与 `JoinError`
+- [ ] 明确一个并发任务失败时的等待、传播与取消策略

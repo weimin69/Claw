@@ -3,6 +3,7 @@ pub mod divide;
 pub mod echo;
 pub mod fetch;
 pub mod hello;
+pub mod parallel_wait;
 pub mod read_config;
 pub mod repeat;
 pub mod sum;

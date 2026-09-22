@@ -60,6 +60,12 @@ async fn run() -> Result<()> {
         } => {
             commands::chat::execute(&config_path, prompt).await?;
         }
+        Commands::ParallelWait {
+            first_seconds,
+            second_seconds,
+        } => {
+            commands::parallel_wait::execute(first_seconds, second_seconds).await?;
+        }
     }
     Ok(())
 }

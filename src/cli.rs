@@ -50,6 +50,10 @@ pub enum Commands {
         config_path: String,
         prompt: Option<String>,
     },
+    ParallelWait {
+        first_seconds: u64,
+        second_seconds: u64,
+    },
 }
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
