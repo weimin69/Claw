@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了 Tokio Task 与基础并发练习，新增 `parallel-wait` 命令，并使用两个 `tokio::spawn` Task 并发等待。明确了 `.await` 不会自动创建并发，Task 必须先创建再等待；同时区分了启动顺序、完成顺序、结果获取顺序和输出顺序。新增 CLI 集成测试保护输出与错误契约，并使用 Tokio 暂停时间和 timeout 确定性验证并发行为。当前格式、编译和完整测试套件均通过，共 36 个测试。
+最近一次学习中，深化了 Tokio Task 的错误边界，将 `parallel-wait` Task 调整为返回业务 `Result`，并明确区分外层 `JoinError` 与内层 `anyhow::Error`。当前选择 wait-all 作为失败策略，抽取私有 `wait_for_both()`，保证两个 Task 均完成等待后再传播错误。新增确定性测试验证第一个 Task panic 或返回业务错误时，仍会等待第二个 Task 完成。当前格式、编译、5 个 `parallel-wait` 单元测试和 2 个 CLI 集成测试均通过。
 
 ## Completed
 
@@ -193,6 +193,16 @@
 - 使用 `#[tokio::test(start_paused = true)]` 和 timeout 确定性验证并发行为
 - 理解测试阈值必须能够区分并发实现和顺序回归
 - 当前 `cargo test` 通过，共 36 个测试
+- 将 `parallel-wait` Task 输出调整为 `anyhow::Result<u64>`
+- 理解 `Result<Result<T, E>, JoinError>` 的双层错误模型
+- 明确 `bail!` 返回内层业务错误，Task panic 返回外层 `JoinError`
+- 理解 `handle.await??` 与分步骤拆解两层 `Result` 的等价关系
+- 理解丢弃 `JoinHandle` 默认不会自动取消 Task
+- 为 `parallel-wait` 选择 wait-all 失败策略
+- 抽取私有 `wait_for_both()` 集中处理等待与错误传播
+- 使用虚拟时间验证 panic 后仍等待第二个 Task
+- 使用虚拟时间验证业务错误后仍等待第二个 Task
+- 当前 `parallel-wait` 5 个单元测试和 2 个 CLI 集成测试通过
 
 ## In Progress
 
@@ -286,19 +296,19 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 先创建两个 Tokio Task，再依次等待结果，并由主流程按参数顺序输出；暂停时间测试使用 2.5 秒 timeout 区分 2 秒并发实现与 3 秒顺序回归。`chat` 当前接受可选命令行 prompt；参数存在时直接使用，缺失时同步读取 stdin，随后统一拒绝空白 prompt，再读取 `[llm]` 配置、校验 API key、调用 `openai_compatible::send_chat_request()` 并输出 assistant 文本。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 先创建两个返回 `anyhow::Result<u64>` 的 Tokio Task，再通过私有 `wait_for_both()` 等待两个 handle，之后按固定顺序传播 `JoinError` 和业务错误并输出结果。暂停时间测试既验证成功路径并发，也验证 panic 与业务错误路径的 wait-all 行为。
 
 ## Next Step
 
-下一步继续深化 Tokio Task 的错误边界：
+下一步完善 wait-all 的错误契约：
 
-- 改进 `parallel-wait` 参数校验，使错误能指出具体非法参数
-- 让最小 Task 返回业务 `Result`，观察 `JoinHandle<Result<T, E>>` 的嵌套结果
-- 区分任务级 `JoinError` 与任务内部业务错误
-- 讨论一个任务失败时 fail-fast 与等待全部任务完成的取舍
-- 使用暂停时间继续编写确定性错误路径测试
+- 分别校验 `first_seconds` 和 `second_seconds`，返回精确参数错误
+- 为第一、第二 Task 的 `JoinError` 和业务错误增加明确上下文
+- 明确两个 Task 同时失败时当前按固定顺序返回哪个错误
+- 讨论是否需要保留多个错误，还是当前阶段只返回一个主错误
+- 在理解错误优先级后，再评估显式取消与生产 timeout
 
-继续一次只引入一个主要 Async Rust 概念；暂不引入 channel、取消机制、Provider trait 或完整 Agent Loop。
+继续一次只引入一个主要 Async Rust 概念；暂不引入 channel、通用任务集合、Provider trait 或完整 Agent Loop。
 
 ## Architecture Notes
 
@@ -340,7 +350,7 @@
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
-- `src/commands/parallel_wait.rs`：创建两个 Tokio Task 并发等待，按参数顺序收集和输出结果，并使用暂停时间测试并发时序
+- `src/commands/parallel_wait.rs`：创建两个返回业务 `Result` 的 Tokio Task，通过私有 `wait_for_both()` 实现 wait-all，按参数顺序传播错误和输出结果，并使用暂停时间测试成功与失败时序
 - `tests/parallel_wait_cli.rs`：验证 `parallel-wait` 的成功输出顺序、失败退出码、stdout 和 stderr 契约
 
 配置格式当前为：
@@ -369,8 +379,8 @@ temperature = 0.7
 - 当前同步读取 stdin 是否应在未来交互式 Agent Runtime 阶段迁移为 Tokio 异步 I/O？
 - 是否需要继续为更多命令增加集成测试？
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
-- 并发 Task 返回业务 `Result` 后，一个任务失败时应立即失败还是等待所有任务结束？
 - 后续是否需要显式取消仍在运行的兄弟 Task？
+- 两个 wait-all Task 同时失败时，应该只返回固定顺序的第一个错误，还是聚合多个错误？
 
 ## Technical Debt
 
@@ -381,10 +391,12 @@ temperature = 0.7
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
 - 当前主要只有 `fetch`、`chat` 和 `parallel-wait` 有 CLI 集成测试，其他命令暂未覆盖
 - `parallel-wait` 当前将两个参数的校验合并处理，错误信息不能指出具体非法参数
+- `wait_for_both()` 当前按 first、second 的固定顺序传播错误，多个错误不会被聚合
+- `wait_for_both()` 当前未为具体 Task 的 JoinError 和业务错误补充上下文
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 
 ## Next TODO
 
 - [ ] 分别校验 `first_seconds` 与 `second_seconds` 并提供精确错误信息
-- [ ] 设计返回业务 `Result` 的 Task，区分业务错误与 `JoinError`
-- [ ] 明确一个并发任务失败时的等待、传播与取消策略
+- [ ] 为两个 Task 的 JoinError 与业务错误补充明确上下文
+- [ ] 明确两个 Task 同时失败时的错误优先级与信息保留策略
