@@ -1,14 +1,14 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 pub async fn execute(first_seconds: u64, second_seconds: u64) -> Result<()> {
-    if first_seconds > 60 || second_seconds > 60 {
-        bail!("seconds must be between 1 and 60");
+    if first_seconds > 60 || first_seconds == 0 {
+        bail!("first_seconds must be between 1 and 60");
     }
-    if first_seconds == 0 || second_seconds == 0 {
-        bail!("seconds must be between 1 and 60");
+    if second_seconds > 60 || second_seconds == 0 {
+        bail!("second_seconds must be between 1 and 60");
     }
     let first_handle = tokio::spawn(async move {
         sleep(Duration::from_secs(first_seconds)).await;
@@ -33,11 +33,11 @@ async fn wait_for_both(
     let first_join_result = first_handle.await;
     let second_join_result = second_handle.await;
 
-    let first_result = first_join_result?;
-    let second_result = second_join_result?;
+    let first_result = first_join_result.context("first task failed to join")?;
+    let second_result = second_join_result.context("second task failed to join")?;
 
-    let first_seconds = first_result?;
-    let second_seconds = second_result?;
+    let first_seconds = first_result.context("first task returned a business error")?;
+    let second_seconds = second_result.context("second task returned a business error")?;
 
     Ok((first_seconds, second_seconds))
 }
@@ -90,7 +90,8 @@ mod tests {
         let started_at = Instant::now();
 
         let result = wait_for_both(first_handle, second_handle).await;
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "first task failed to join");
         assert_eq!(started_at.elapsed(), Duration::from_secs(2));
     }
 
@@ -107,7 +108,44 @@ mod tests {
         let started_at = Instant::now();
 
         let result = wait_for_both(first_handle, second_handle).await;
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "first task returned a business error");
         assert_eq!(started_at.elapsed(), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn second_panic_has_join_context() {
+        let first_handle: JoinHandle<Result<u64>> = tokio::spawn(async { Ok(1) });
+        let second_handle: JoinHandle<Result<u64>> =
+            tokio::spawn(async { panic!("second task panic") });
+
+        let result = wait_for_both(first_handle, second_handle).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "second task failed to join");
+    }
+
+    #[tokio::test]
+    async fn second_business_failure_has_context() {
+        let first_handle: JoinHandle<Result<u64>> = tokio::spawn(async { Ok(1) });
+        let second_handle: JoinHandle<Result<u64>> = tokio::spawn(async {
+            Err::<u64, anyhow::Error>(anyhow::anyhow!("second task business failure"))
+        });
+
+        let result = wait_for_both(first_handle, second_handle).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "second task returned a business error");
+    }
+
+    #[tokio::test]
+    async fn join_error_takes_priority_over_first_business_error() {
+        let first_handle: JoinHandle<Result<u64>> = tokio::spawn(async {
+            Err::<u64, anyhow::Error>(anyhow::anyhow!("first task business failure"))
+        });
+        let second_handle: JoinHandle<Result<u64>> =
+            tokio::spawn(async { panic!("second task panic") });
+
+        let result = wait_for_both(first_handle, second_handle).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "second task failed to join");
     }
 }

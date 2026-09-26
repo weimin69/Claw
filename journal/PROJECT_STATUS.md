@@ -2,7 +2,7 @@
 
 ## Current Stage
 
-当前项目处于 Rust CLI 基础架构、Async Rust 入门和 LLM API 集成的交界阶段。
+当前项目已完成进入 Agent 开发所需的第一批 Rust CLI、Async Rust 和 LLM API 基础，准备进入最小 Agent Runtime 阶段。
 
 目标仍然是通过一个小型 Agent CLI 项目，逐步掌握：
 
@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，深化了 Tokio Task 的错误边界，将 `parallel-wait` Task 调整为返回业务 `Result`，并明确区分外层 `JoinError` 与内层 `anyhow::Error`。当前选择 wait-all 作为失败策略，抽取私有 `wait_for_both()`，保证两个 Task 均完成等待后再传播错误。新增确定性测试验证第一个 Task panic 或返回业务错误时，仍会等待第二个 Task 完成。当前格式、编译、5 个 `parallel-wait` 单元测试和 2 个 CLI 集成测试均通过。
+最近一次学习中，完成了 `parallel-wait` 错误契约收尾：first/second 参数使用独立校验，first/second Task 的 JoinError 与业务错误具有明确上下文，并通过测试固定当前双重失败优先级。`parallel-wait` 当前 8 个单元测试和 3 个 CLI 集成测试通过。开发者明确希望更快进入 Agent 开发，因此后续直接进入 Stage 6 的最小 Agent Runtime；尚未覆盖的 timeout、取消、日志和 CLI 打磨将在 Agent 场景出现真实需求时补充。
 
 ## Completed
 
@@ -203,6 +203,14 @@
 - 使用虚拟时间验证 panic 后仍等待第二个 Task
 - 使用虚拟时间验证业务错误后仍等待第二个 Task
 - 当前 `parallel-wait` 5 个单元测试和 2 个 CLI 集成测试通过
+- 分别校验 `first_seconds` 与 `second_seconds` 并返回精确错误信息
+- 为 first/second Task 的 JoinError 与业务错误添加明确上下文
+- 为两个参数分别添加 CLI 错误路径测试
+- 为 second Task 的 panic 和业务错误添加上下文单元测试
+- 明确并测试当前错误优先级：JoinError 优先于尚未检查的业务错误
+- 当前 `parallel-wait` 8 个单元测试和 3 个 CLI 集成测试通过
+- 明确学习型 CLI 命令不要求原样进入最终 Agent 产品
+- 决定从下一次学习开始进入最小 Agent Runtime
 
 ## In Progress
 
@@ -296,19 +304,19 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 先创建两个返回 `anyhow::Result<u64>` 的 Tokio Task，再通过私有 `wait_for_both()` 等待两个 handle，之后按固定顺序传播 `JoinError` 和业务错误并输出结果。暂停时间测试既验证成功路径并发，也验证 panic 与业务错误路径的 wait-all 行为。
+当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 已完成其 Task、wait-all、错误边界和确定性测试学习目标，不再继续产品化扩展。`chat` 已具备配置、prompt 输入、OpenAI-compatible 单次请求和确定性 HTTP 集成测试，将作为进入 Agent Loop 的主要基础。
 
 ## Next Step
 
-下一步完善 wait-all 的错误契约：
+下一步进入 Stage 6 的最小 Agent Runtime 设计：
 
-- 分别校验 `first_seconds` 和 `second_seconds`，返回精确参数错误
-- 为第一、第二 Task 的 `JoinError` 和业务错误增加明确上下文
-- 明确两个 Task 同时失败时当前按固定顺序返回哪个错误
-- 讨论是否需要保留多个错误，还是当前阶段只返回一个主错误
-- 在理解错误优先级后，再评估显式取消与生产 timeout
+- 对比当前一次性 `chat` 控制流与 Agent Loop
+- 定义最小运行状态、循环条件、最终回答和最大迭代次数
+- 先设计可确定性测试的模型响应边界，避免测试依赖真实 LLM
+- 第一版只支持一个最小工具与明确的工具调用/结果回传边界
+- 在真实 Agent 控制流中按需引入 timeout、取消、错误恢复和可观测性
 
-继续一次只引入一个主要 Async Rust 概念；暂不引入 channel、通用任务集合、Provider trait 或完整 Agent Loop。
+继续坚持一次只引入一个主要概念。暂不引入插件系统、持久化、规划/反思框架、通用 Provider trait 或大型 Agent 框架。
 
 ## Architecture Notes
 
@@ -381,6 +389,8 @@ temperature = 0.7
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
 - 后续是否需要显式取消仍在运行的兄弟 Task？
 - 两个 wait-all Task 同时失败时，应该只返回固定顺序的第一个错误，还是聚合多个错误？
+- 第一版 Agent Runtime 应采用怎样的最小模型响应边界，才能同时支持确定性测试和后续真实 LLM 接入？
+- 第一版最小工具应选择什么场景，既能展示完整 Agent Loop 又不引入额外领域复杂度？
 
 ## Technical Debt
 
@@ -390,13 +400,14 @@ temperature = 0.7
 - 旧日志文件 `2026-7-14.md` 与标准命名 `2026-07-14.md` 同时存在，后续需要决定是否迁移或保留
 - `Config.toml` 当前是本地运行配置，需要确认是否应改为示例配置或从 Git 中移除真实 key
 - 当前主要只有 `fetch`、`chat` 和 `parallel-wait` 有 CLI 集成测试，其他命令暂未覆盖
-- `parallel-wait` 当前将两个参数的校验合并处理，错误信息不能指出具体非法参数
-- `wait_for_both()` 当前按 first、second 的固定顺序传播错误，多个错误不会被聚合
-- `wait_for_both()` 当前未为具体 Task 的 JoinError 和业务错误补充上下文
+- `parallel-wait` 是学习型命令，未来产品清理阶段需要决定删除、隐藏或保留
+- `wait_for_both()` 当前不聚合多个错误，按 JoinError 优先、再按任务顺序传播主错误
+- Async Rust 的显式取消与生产 timeout 尚未系统学习，将在 Agent Runtime 中补充
+- CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 
 ## Next TODO
 
-- [ ] 分别校验 `first_seconds` 与 `second_seconds` 并提供精确错误信息
-- [ ] 为两个 Task 的 JoinError 与业务错误补充明确上下文
-- [ ] 明确两个 Task 同时失败时的错误优先级与信息保留策略
+- [ ] 对比当前 chat 控制流与最小 Agent Loop
+- [ ] 定义 Agent Runtime 的状态、终止条件和最大迭代次数
+- [ ] 设计可使用 fake model 确定性测试的最小响应边界

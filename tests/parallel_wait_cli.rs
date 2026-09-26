@@ -14,7 +14,7 @@ fn parallel_wait_prints_results_in_argument_order() {
 }
 
 #[test]
-fn parallel_wait_rejects_zero_seconds() {
+fn parallel_wait_rejects_zero_first_seconds() {
     let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
     cmd.arg("parallel-wait")
         .arg("0")
@@ -22,5 +22,21 @@ fn parallel_wait_rejects_zero_seconds() {
         .assert()
         .failure()
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("seconds must be between 1 and 60"));
+        .stderr(predicate::str::contains(
+            "first_seconds must be between 1 and 60",
+        ));
+}
+
+#[test]
+fn parallel_wait_rejects_zero_second_seconds() {
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+    cmd.arg("parallel-wait")
+        .arg("1")
+        .arg("0")
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "second_seconds must be between 1 and 60",
+        ));
 }
