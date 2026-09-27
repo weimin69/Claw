@@ -2,7 +2,7 @@
 
 ## Current Stage
 
-当前项目已完成进入 Agent 开发所需的第一批 Rust CLI、Async Rust 和 LLM API 基础，准备进入最小 Agent Runtime 阶段。
+当前项目已进入 Stage 6 的最小 Agent Runtime 实现阶段。
 
 目标仍然是通过一个小型 Agent CLI 项目，逐步掌握：
 
@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了 `parallel-wait` 错误契约收尾：first/second 参数使用独立校验，first/second Task 的 JoinError 与业务错误具有明确上下文，并通过测试固定当前双重失败优先级。`parallel-wait` 当前 8 个单元测试和 3 个 CLI 集成测试通过。开发者明确希望更快进入 Agent 开发，因此后续直接进入 Stage 6 的最小 Agent Runtime；尚未覆盖的 timeout、取消、日志和 CLI 打磨将在 Agent 场景出现真实需求时补充。
+最近一次学习中，新增 `src/agent.rs`，建立了 Agent Runtime 的第一批核心类型：`ModelDecision`、`AgentMessage` 和 `AgentState`。实现了 prompt 与迭代上限不变量、异步 `AgentModel` trait、FIFO FakeModel、直接返回最终答案的最小 `run_agent()`，并定义了尚未接入的 `ToolExecutor` 边界。当前 Agent 模块 6 个测试通过；普通构建因 Agent Runtime 尚未接入 CLI 仍存在预期的 dead-code 警告。
 
 ## Completed
 
@@ -211,6 +211,18 @@
 - 当前 `parallel-wait` 8 个单元测试和 3 个 CLI 集成测试通过
 - 明确学习型 CLI 命令不要求原样进入最终 Agent 产品
 - 决定从下一次学习开始进入最小 Agent Runtime
+- 新增 `src/agent.rs` 并注册 `agent` 模块
+- 定义 `ModelDecision::FinalAnswer` 与 `ToolCall`
+- 定义带语义的 User、ToolCall 和 ToolResult Agent messages
+- 定义 `AgentState` 的 messages、iteration 和 max_iterations
+- 使用 `AgentState::new()` 保证 prompt 与最大迭代次数不变量
+- 实现模型调用前的 `begin_iteration()` 上限检查
+- 定义异步 `AgentModel` trait
+- 使用 `VecDeque` 实现测试专用 FIFO FakeModel
+- 测试 FakeModel 的决策顺序与耗尽错误
+- 实现 `run_agent()` 的 FinalAnswer 最小路径
+- 定义异步 `ToolExecutor` trait
+- 当前 Agent 模块 6 个测试通过
 
 ## In Progress
 
@@ -304,19 +316,20 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前大多数命令的 `execute()` 仍保持同步并返回 `anyhow::Result<()>`。`wait`、`fetch`、`chat` 和 `parallel-wait` 是当前异步命令。`parallel-wait` 已完成其 Task、wait-all、错误边界和确定性测试学习目标，不再继续产品化扩展。`chat` 已具备配置、prompt 输入、OpenAI-compatible 单次请求和确定性 HTTP 集成测试，将作为进入 Agent Loop 的主要基础。
+当前新增 `agent.rs` 作为最小 Agent Runtime 模块。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；当前 `run_agent()` 只支持 FinalAnswer，ToolCall 仍返回未实现错误。`chat` 继续保留单次 OpenAI-compatible 调用，后续在 Runtime 控制流稳定后再适配真实模型。
 
 ## Next Step
 
-下一步进入 Stage 6 的最小 Agent Runtime 设计：
+下一步完成第一版单工具 Agent Loop：
 
-- 对比当前一次性 `chat` 控制流与 Agent Loop
-- 定义最小运行状态、循环条件、最终回答和最大迭代次数
-- 先设计可确定性测试的模型响应边界，避免测试依赖真实 LLM
-- 第一版只支持一个最小工具与明确的工具调用/结果回传边界
-- 在真实 Agent 控制流中按需引入 timeout、取消、错误恢复和可观测性
+- 在测试模块中实现记录 name/input 的 FakeToolExecutor
+- 让 `run_agent()` 同时依赖 `AgentModel` 与 `ToolExecutor`
+- 处理 ToolCall，执行工具并把 ToolCall/ToolResult 写入 messages
+- 下一轮把更新后的 messages 交给模型
+- 使用 FakeModel 验证“工具调用 → 工具结果 → 最终回答”两轮流程
+- 验证工具错误、未知工具和最大迭代次数错误路径
 
-继续坚持一次只引入一个主要概念。暂不引入插件系统、持久化、规划/反思框架、通用 Provider trait 或大型 Agent 框架。
+继续坚持最小边界。暂不实现多工具并发、tool call ID、插件注册表、持久化、规划/反思或真实 Provider 适配。
 
 ## Architecture Notes
 
@@ -327,6 +340,7 @@
 ├── src/
 │   ├── cli.rs
 │   ├── config.rs
+│   ├── agent.rs
 │   ├── main.rs
 │   ├── openai_compatible.rs
 │   └── commands/
@@ -356,6 +370,7 @@
 - `src/config.rs`：定义配置模型、默认值、环境变量 fallback、业务校验和 `load_config(path)`
 - `src/openai_compatible.rs`：负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
+- `src/agent.rs`：定义最小 Agent Runtime 的决策、消息、状态、迭代限制、模型/工具行为边界和循环入口；当前只完成 FinalAnswer 路径
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
 - `src/commands/parallel_wait.rs`：创建两个返回业务 `Result` 的 Tokio Task，通过私有 `wait_for_both()` 实现 wait-all，按参数顺序传播错误和输出结果，并使用暂停时间测试成功与失败时序
@@ -389,8 +404,8 @@ temperature = 0.7
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
 - 后续是否需要显式取消仍在运行的兄弟 Task？
 - 两个 wait-all Task 同时失败时，应该只返回固定顺序的第一个错误，还是聚合多个错误？
-- 第一版 Agent Runtime 应采用怎样的最小模型响应边界，才能同时支持确定性测试和后续真实 LLM 接入？
-- 第一版最小工具应选择什么场景，既能展示完整 Agent Loop 又不引入额外领域复杂度？
+- 第一版真实工具是否采用确定性的 `add`，其输入应暂用简单字符串还是立即使用结构化 JSON？
+- `AgentModel` 与 `ToolExecutor` 的原生 async trait 在需要 trait object 前是否继续保持泛型使用？
 
 ## Technical Debt
 
@@ -405,9 +420,12 @@ temperature = 0.7
 - Async Rust 的显式取消与生产 timeout 尚未系统学习，将在 Agent Runtime 中补充
 - CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
+- Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
+- `run_agent()` 尚未实现 ToolCall 路径，ToolExecutor trait 尚无实现
+- Agent messages 暂无 tool call ID，第一版只适合单工具顺序调用
 
 ## Next TODO
 
-- [ ] 对比当前 chat 控制流与最小 Agent Loop
-- [ ] 定义 Agent Runtime 的状态、终止条件和最大迭代次数
-- [ ] 设计可使用 fake model 确定性测试的最小响应边界
+- [ ] 实现 FakeToolExecutor 并记录工具调用
+- [ ] 在 run_agent 中执行工具并回写 ToolCall/ToolResult
+- [ ] 用 FakeModel 验证两轮模型决策的完整 Agent Loop
