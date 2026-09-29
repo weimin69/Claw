@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，新增 `src/agent.rs`，建立了 Agent Runtime 的第一批核心类型：`ModelDecision`、`AgentMessage` 和 `AgentState`。实现了 prompt 与迭代上限不变量、异步 `AgentModel` trait、FIFO FakeModel、直接返回最终答案的最小 `run_agent()`，并定义了尚未接入的 `ToolExecutor` 边界。当前 Agent 模块 6 个测试通过；普通构建因 Agent Runtime 尚未接入 CLI 仍存在预期的 dead-code 警告。
+最近一次学习中，完成了第一版单工具 Agent Loop：`run_agent()` 现在同时依赖 `AgentModel` 与 `ToolExecutor`，能够执行 `ToolCall`、把调用与结果写回消息历史并进入下一轮模型决策。FakeModel 会记录每轮收到的消息快照，FakeToolExecutor 会记录工具名称与输入；测试已覆盖直接回答、两轮工具流程和最大迭代次数。当前 Agent 模块 9 个测试通过；Runtime 尚未接入 CLI，因此普通构建仍存在预期的 dead-code 警告。
 
 ## Completed
 
@@ -222,7 +222,14 @@
 - 测试 FakeModel 的决策顺序与耗尽错误
 - 实现 `run_agent()` 的 FinalAnswer 最小路径
 - 定义异步 `ToolExecutor` trait
-- 当前 Agent 模块 6 个测试通过
+- 实现测试专用 FakeToolExecutor 并记录工具调用
+- `run_agent()` 同时依赖 AgentModel 与 ToolExecutor
+- 实现 ToolCall 执行及 ToolCall/ToolResult 消息回写
+- FakeModel 记录每轮收到的消息快照
+- 验证“工具调用 → 工具结果 → 最终回答”的两轮 Agent Loop
+- 验证直接回答时不执行工具
+- 验证达到最大迭代次数后不再调用模型
+- 当前 Agent 模块 9 个测试通过
 
 ## In Progress
 
@@ -316,18 +323,17 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前新增 `agent.rs` 作为最小 Agent Runtime 模块。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；当前 `run_agent()` 只支持 FinalAnswer，ToolCall 仍返回未实现错误。`chat` 继续保留单次 OpenAI-compatible 调用，后续在 Runtime 控制流稳定后再适配真实模型。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；`run_agent()` 已支持 FinalAnswer 与顺序 ToolCall，并在工具成功后更新上下文再调用模型。`chat` 继续保留单次 OpenAI-compatible 调用，后续在 Runtime 错误边界稳定后再适配真实模型。
 
 ## Next Step
 
-下一步完成第一版单工具 Agent Loop：
+下一步完善第一版单工具 Agent Loop 的错误边界：
 
-- 在测试模块中实现记录 name/input 的 FakeToolExecutor
-- 让 `run_agent()` 同时依赖 `AgentModel` 与 `ToolExecutor`
-- 处理 ToolCall，执行工具并把 ToolCall/ToolResult 写入 messages
-- 下一轮把更新后的 messages 交给模型
-- 使用 FakeModel 验证“工具调用 → 工具结果 → 最终回答”两轮流程
-- 验证工具错误、未知工具和最大迭代次数错误路径
+- 使用失败型 FakeToolExecutor 验证工具错误传播
+- 决定并测试工具错误是否需要由 Runtime 增加上下文
+- 明确未知工具由 ToolExecutor 还是未来 Tool Registry 负责识别
+- 为未知工具添加确定性错误测试
+- 完成错误路径后评估第一个真实确定性工具
 
 继续坚持最小边界。暂不实现多工具并发、tool call ID、插件注册表、持久化、规划/反思或真实 Provider 适配。
 
@@ -370,7 +376,7 @@
 - `src/config.rs`：定义配置模型、默认值、环境变量 fallback、业务校验和 `load_config(path)`
 - `src/openai_compatible.rs`：负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
-- `src/agent.rs`：定义最小 Agent Runtime 的决策、消息、状态、迭代限制、模型/工具行为边界和循环入口；当前只完成 FinalAnswer 路径
+- `src/agent.rs`：定义最小 Agent Runtime 的决策、消息、状态、迭代限制、模型/工具行为边界和循环入口；当前支持直接回答和单工具顺序调用
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
 - `src/commands/parallel_wait.rs`：创建两个返回业务 `Result` 的 Tokio Task，通过私有 `wait_for_both()` 实现 wait-all，按参数顺序传播错误和输出结果，并使用暂停时间测试成功与失败时序
@@ -421,11 +427,11 @@ temperature = 0.7
 - CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 - Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
-- `run_agent()` 尚未实现 ToolCall 路径，ToolExecutor trait 尚无实现
+- 工具执行错误与未知工具错误路径尚未完成测试
 - Agent messages 暂无 tool call ID，第一版只适合单工具顺序调用
 
 ## Next TODO
 
-- [ ] 实现 FakeToolExecutor 并记录工具调用
-- [ ] 在 run_agent 中执行工具并回写 ToolCall/ToolResult
-- [ ] 用 FakeModel 验证两轮模型决策的完整 Agent Loop
+- [ ] 测试并完善工具执行错误传播
+- [ ] 设计并测试未知工具错误边界
+- [ ] 整理并提交本次 Agent Loop 变更
