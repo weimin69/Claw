@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod openai_compatible;
+mod tools;
 
 use crate::cli::{Cli, Commands};
 use anyhow::Result;

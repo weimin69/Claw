@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了第一版单工具 Agent Loop：`run_agent()` 现在同时依赖 `AgentModel` 与 `ToolExecutor`，能够执行 `ToolCall`、把调用与结果写回消息历史并进入下一轮模型决策。FakeModel 会记录每轮收到的消息快照，FakeToolExecutor 会记录工具名称与输入；测试已覆盖直接回答、两轮工具流程和最大迭代次数。当前 Agent 模块 9 个测试通过；Runtime 尚未接入 CLI，因此普通构建仍存在预期的 dead-code 警告。
+最近一次学习中，完善了工具错误边界：`run_agent()` 会为工具错误补充工具名上下文并保留底层错误链，失败后不会再次调用模型。新增 `src/tools.rs`，使用结构化 JSON 实现确定性的 `add` 工具，并建立了最小 `BuiltinToolExecutor` 名称分发。当前 Agent 模块 10 个测试、工具模块 4 个测试通过，完整测试共 58 个；BuiltinToolExecutor 的直接分发测试和真实 Runtime 接入仍待完成。
 
 ## Completed
 
@@ -229,7 +229,15 @@
 - 验证“工具调用 → 工具结果 → 最终回答”的两轮 Agent Loop
 - 验证直接回答时不执行工具
 - 验证达到最大迭代次数后不再调用模型
-- 当前 Agent 模块 9 个测试通过
+- 使用失败型 ToolExecutor 验证工具错误会终止 Agent Loop
+- 为工具错误补充工具名称上下文并保留底层错误链
+- 当前 Agent 模块 10 个测试通过
+- 新增 `src/tools.rs` 内置工具模块
+- 使用 JSON 定义结构化 AddInput
+- 实现带解析上下文与溢出保护的 execute_add()
+- 为 add 的解析、成功、缺少字段和溢出路径添加 4 个测试
+- 实现最小 BuiltinToolExecutor，支持 add 与未知工具错误分支
+- 当前完整测试共 58 个并全部通过
 
 ## In Progress
 
@@ -323,17 +331,17 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前 `agent.rs` 已形成第一版单工具 Agent Runtime。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；`run_agent()` 已支持 FinalAnswer 与顺序 ToolCall，并在工具成功后更新上下文再调用模型。`chat` 继续保留单次 OpenAI-compatible 调用，后续在 Runtime 错误边界稳定后再适配真实模型。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；`run_agent()` 已支持 FinalAnswer、顺序 ToolCall、工具错误上下文和错误链。`tools.rs` 开始承载具体内置工具与名称分发。`chat` 继续保留单次 OpenAI-compatible 调用，后续在确定性工具链路稳定后再适配真实模型。
 
 ## Next Step
 
-下一步完善第一版单工具 Agent Loop 的错误边界：
+下一步完成 BuiltinToolExecutor 的直接验证与 Runtime 接入：
 
-- 使用失败型 FakeToolExecutor 验证工具错误传播
-- 决定并测试工具错误是否需要由 Runtime 增加上下文
-- 明确未知工具由 ToolExecutor 还是未来 Tool Registry 负责识别
-- 为未知工具添加确定性错误测试
-- 完成错误路径后评估第一个真实确定性工具
+- 测试 `add` 名称能够正确分发到结构化工具实现
+- 测试未知工具返回包含实际名称的明确错误
+- 使用 FakeModel 与 BuiltinToolExecutor 跑通确定性 Agent Loop
+- 完成验证后提交本次工具执行器变更
+- 随后评估真实模型适配或更有产品价值的工具
 
 继续坚持最小边界。暂不实现多工具并发、tool call ID、插件注册表、持久化、规划/反思或真实 Provider 适配。
 
@@ -349,6 +357,7 @@
 │   ├── agent.rs
 │   ├── main.rs
 │   ├── openai_compatible.rs
+│   ├── tools.rs
 │   └── commands/
 │       ├── chat.rs
 │       ├── divide.rs
@@ -377,6 +386,7 @@
 - `src/openai_compatible.rs`：负责 OpenAI-compatible Chat Completions 请求构造、HTTP 请求、HTTP status 判断和响应解析
 - `src/main.rs`：`run()` 负责 `Cli::parse()`、`match Commands` 和命令分发；`main()` 负责启动 Tokio runtime、统一错误输出和失败退出码
 - `src/agent.rs`：定义最小 Agent Runtime 的决策、消息、状态、迭代限制、模型/工具行为边界和循环入口；当前支持直接回答和单工具顺序调用
+- `src/tools.rs`：定义具体内置工具和最小名称分发；当前支持结构化 JSON `add`，未知名称返回错误
 - `tests/fetch_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 HTTP 响应，验证 `fetch` 的 stdout、stderr、exit code 和参数解析行为
 - `tests/chat_cli.rs`：使用 `assert_cmd` 运行真实 CLI binary，使用 `wiremock` 提供确定性的本地 OpenAI-compatible HTTP 响应，使用临时配置文件验证 `chat` 的 stdout、stderr、exit code、配置边界、请求体边界、stdin fallback、输入优先级和空白 prompt 错误路径
 - `src/commands/parallel_wait.rs`：创建两个返回业务 `Result` 的 Tokio Task，通过私有 `wait_for_both()` 实现 wait-all，按参数顺序传播错误和输出结果，并使用暂停时间测试成功与失败时序
@@ -410,7 +420,6 @@ temperature = 0.7
 - 是否需要为 `AGENT_CLI_LLM_API_KEY` 增加用户文档或示例配置说明？
 - 后续是否需要显式取消仍在运行的兄弟 Task？
 - 两个 wait-all Task 同时失败时，应该只返回固定顺序的第一个错误，还是聚合多个错误？
-- 第一版真实工具是否采用确定性的 `add`，其输入应暂用简单字符串还是立即使用结构化 JSON？
 - `AgentModel` 与 `ToolExecutor` 的原生 async trait 在需要 trait object 前是否继续保持泛型使用？
 
 ## Technical Debt
@@ -427,11 +436,12 @@ temperature = 0.7
 - CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 - Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
-- 工具执行错误与未知工具错误路径尚未完成测试
+- BuiltinToolExecutor 的 add 分发和未知工具分支尚未直接测试
+- BuiltinToolExecutor 尚未接入确定性 Agent Loop 测试或 CLI
 - Agent messages 暂无 tool call ID，第一版只适合单工具顺序调用
 
 ## Next TODO
 
-- [ ] 测试并完善工具执行错误传播
-- [ ] 设计并测试未知工具错误边界
-- [ ] 整理并提交本次 Agent Loop 变更
+- [ ] 测试 BuiltinToolExecutor 的 add 分发
+- [ ] 测试 BuiltinToolExecutor 的未知工具错误
+- [ ] 将真实内置执行器接入确定性 Agent Loop 测试并提交

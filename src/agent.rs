@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ModelDecision {
@@ -63,7 +63,10 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
         match decision {
             ModelDecision::FinalAnswer(answer) => return Ok(answer),
             ModelDecision::ToolCall { name, input } => {
-                let output = tool_executor.execute(&name, &input).await?;
+                let output = tool_executor
+                    .execute(&name, &input)
+                    .await
+                    .with_context(|| format!("tool `{name}` execution failed"))?;
                 state.messages.push(AgentMessage::ToolCall {
                     name: name.clone(),
                     input,
@@ -255,35 +258,72 @@ mod tests {
 
     #[tokio::test]
     async fn stops_after_reaching_max_iterations() {
-        // FakeModel 只需要一个 ToolCall
         let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
             name: "add".to_string(),
             input: "2,3".to_string(),
         }]);
 
-        // FakeToolExecutor 返回 "5"
         let mut tool_executor = FakeToolExecutor {
             output: "5".to_string(),
             calls: Vec::new(),
         };
 
-        // run_agent 的 max_iterations 设为 1
         let result = run_agent(&mut model, "hello".to_string(), 1, &mut tool_executor).await;
 
-        // 不要 unwrap 成成功答案，而是取得 unwrap_err()
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "agent reached maximum iterations");
 
-        // 断言工具调用记录仍有一次 add("2,3")
         assert_eq!(
             tool_executor.calls,
             vec![("add".to_string(), "2,3".to_string())]
         );
-        // 断言 model.received_messages.len() 等于 1
         assert_eq!(model.received_messages.len(), 1);
     }
-}
 
+    struct FailingToolExecutor {
+        calls: Vec<(String, String)>,
+    }
+
+    impl ToolExecutor for FailingToolExecutor {
+        async fn execute(&mut self, name: &str, input: &str) -> Result<String> {
+            self.calls.push((name.to_string(), input.to_string()));
+
+            bail!("tool execution failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_error_when_tool_execution_fails() {
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
+            name: "add".to_string(),
+            input: "2,3".to_string(),
+        }]);
+
+        let mut tool_executor = FailingToolExecutor { calls: Vec::new() };
+
+        let result = run_agent(&mut model, "hello".to_string(), 2, &mut tool_executor);
+
+        let error = result.await.unwrap_err();
+        assert_eq!(error.to_string(), "tool `add` execution failed");
+
+        assert_eq!(
+            tool_executor.calls,
+            vec![("add".to_string(), "2,3".to_string())]
+        );
+
+        assert_eq!(model.received_messages.len(), 1);
+
+        let error_chain: Vec<String> = error.chain().map(|cause| cause.to_string()).collect();
+
+        assert_eq!(
+            error_chain,
+            vec![
+                "tool `add` execution failed".to_string(),
+                "tool execution failed".to_string(),
+            ]
+        );
+    }
+}
 /*这里是对本文件的补充说明，也就是个人笔记
 ModelDecision：这个就是模型本轮作出的决定，决定使用answer还是接着调用工具
 
