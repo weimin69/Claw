@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完善了工具错误边界：`run_agent()` 会为工具错误补充工具名上下文并保留底层错误链，失败后不会再次调用模型。新增 `src/tools.rs`，使用结构化 JSON 实现确定性的 `add` 工具，并建立了最小 `BuiltinToolExecutor` 名称分发。当前 Agent 模块 10 个测试、工具模块 4 个测试通过，完整测试共 58 个；BuiltinToolExecutor 的直接分发测试和真实 Runtime 接入仍待完成。
+最近一次学习中，完成了 BuiltinToolExecutor 的直接分发测试和确定性 Runtime 接入，Agent 模块现有 11 个测试、工具模块现有 6 个测试。为 ToolCall 与 ToolResult 增加了关联 ID，并开始实现 OpenAI-compatible Tool Calling 协议适配：ChatMessage 已改为角色 enum，AgentMessage 可映射为 user、assistant tool_calls 和 tool 消息。当前 OpenAI-compatible 模块 8 个测试通过；完整 Agent 请求、响应决策解析和真实 AgentModel 适配器仍待完成。
 
 ## Completed
 
@@ -238,6 +238,16 @@
 - 为 add 的解析、成功、缺少字段和溢出路径添加 4 个测试
 - 实现最小 BuiltinToolExecutor，支持 add 与未知工具错误分支
 - 当前完整测试共 58 个并全部通过
+- 测试 BuiltinToolExecutor 的 add 分发和未知工具错误
+- 使用 BuiltinToolExecutor 跑通确定性 Agent Loop
+- 当前 Agent 模块 11 个测试、工具模块 6 个测试通过
+- 为 ModelDecision::ToolCall 和 AgentMessage 工具消息增加关联 ID
+- 验证 ToolCall.id 与 ToolResult.tool_call_id 的对应关系
+- 将 ChatMessage 重构为按 role 标记的 serde enum
+- 定义 ChatToolCall 与 ChatFunctionCall 协议 DTO
+- 实现 AgentMessage 到 OpenAI-compatible 三类消息的映射
+- 为完整消息映射添加 JSON 序列化测试
+- 当前 OpenAI-compatible 模块 8 个测试通过
 
 ## In Progress
 
@@ -331,19 +341,20 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前 `agent.rs` 已形成第一版单工具 Agent Runtime。它定义模型决策、上下文消息、运行状态、迭代上限、模型行为边界、工具执行边界和 `run_agent()`；`run_agent()` 已支持 FinalAnswer、顺序 ToolCall、工具错误上下文和错误链。`tools.rs` 开始承载具体内置工具与名称分发。`chat` 继续保留单次 OpenAI-compatible 调用，后续在确定性工具链路稳定后再适配真实模型。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能把完整 AgentMessage 历史映射成 provider 协议消息，但现有 HTTP 入口仍只接收单个 prompt，响应也仍只解析 content；下一步继续完成请求工具定义、tool_calls 响应解析和 AgentModel 适配。
 
 ## Next Step
 
-下一步完成 BuiltinToolExecutor 的直接验证与 Runtime 接入：
+下一步完成 OpenAI-compatible AgentModel 的协议适配：
 
-- 测试 `add` 名称能够正确分发到结构化工具实现
-- 测试未知工具返回包含实际名称的明确错误
-- 使用 FakeModel 与 BuiltinToolExecutor 跑通确定性 Agent Loop
-- 完成验证后提交本次工具执行器变更
-- 随后评估真实模型适配或更有产品价值的工具
+- 让 Agent 请求构造器接收完整消息历史
+- 在请求中加入 `add` function tool 的 JSON Schema
+- 扩展响应 DTO，同时表达 content 与 tool_calls
+- 将响应转换为 FinalAnswer 或带关联 ID 的 ToolCall
+- 使用纯序列化/反序列化测试固定协议契约
+- 最后实现 AgentModel 并接入现有 HTTP 请求路径
 
-继续坚持最小边界。暂不实现多工具并发、tool call ID、插件注册表、持久化、规划/反思或真实 Provider 适配。
+继续坚持最小边界。暂不实现单轮多工具调用、多工具并发、插件注册表、持久化或规划/反思。
 
 ## Architecture Notes
 
@@ -436,12 +447,13 @@ temperature = 0.7
 - CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 - Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
-- BuiltinToolExecutor 的 add 分发和未知工具分支尚未直接测试
-- BuiltinToolExecutor 尚未接入确定性 Agent Loop 测试或 CLI
-- Agent messages 暂无 tool call ID，第一版只适合单工具顺序调用
+- OpenAI-compatible Agent 请求尚未使用完整 AgentMessage 历史和工具定义
+- provider tool_calls 响应尚未转换为 ModelDecision
+- OpenAI-compatible AgentModel 尚未实现，Runtime 仍未接入 CLI
+- 当前每个 ModelDecision 只表达一次 ToolCall，尚不支持模型单轮返回多个工具调用
 
 ## Next TODO
 
-- [ ] 测试 BuiltinToolExecutor 的 add 分发
-- [ ] 测试 BuiltinToolExecutor 的未知工具错误
-- [ ] 将真实内置执行器接入确定性 Agent Loop 测试并提交
+- [ ] 构造包含完整历史和工具定义的 Agent 请求
+- [ ] 解析 provider 的 FinalAnswer 与 ToolCall 响应
+- [ ] 实现并测试 OpenAI-compatible AgentModel 适配器

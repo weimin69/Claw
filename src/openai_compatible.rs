@@ -1,5 +1,6 @@
 //! Client behavior for the OpenAI-compatible Chat Completions protocol.
 
+use crate::agent::AgentMessage;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -12,9 +13,38 @@ struct ChatRequest {
 }
 
 #[derive(Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
+#[serde(tag = "role")]
+enum ChatMessage {
+    #[serde(rename = "user")]
+    User { content: String },
+
+    #[serde(rename = "assistant")]
+    Assistant {
+        content: Option<String>,
+        tool_calls: Vec<ChatToolCall>,
+    },
+
+    #[serde(rename = "tool")]
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
+}
+
+#[derive(Serialize)]
+struct ChatToolCall {
+    id: String,
+
+    #[serde(rename = "type")]
+    kind: String,
+
+    function: ChatFunctionCall,
+}
+
+#[derive(Serialize)]
+struct ChatFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +104,38 @@ fn ensure_success_status(status: reqwest::StatusCode) -> Result<()> {
     Ok(())
 }
 
+fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::User(content) => ChatMessage::User {
+                content: content.clone(),
+            },
+
+            AgentMessage::ToolCall { id, name, input } => ChatMessage::Assistant {
+                content: None,
+                tool_calls: vec![ChatToolCall {
+                    id: id.clone(),
+                    kind: "function".to_string(),
+                    function: ChatFunctionCall {
+                        name: name.clone(),
+                        arguments: input.clone(),
+                    },
+                }],
+            },
+
+            AgentMessage::ToolResult {
+                tool_call_id,
+                output,
+                ..
+            } => ChatMessage::Tool {
+                tool_call_id: tool_call_id.clone(),
+                content: output.clone(),
+            },
+        })
+        .collect()
+}
+
 fn parse_chat_response(text: &str) -> Result<String> {
     let chat_response: ChatResponse =
         serde_json::from_str(text).context("failed to parse chat response")?;
@@ -96,10 +158,7 @@ fn build_chat_request(model: String, temperature: f64, prompt: String) -> ChatRe
     ChatRequest {
         model,
         temperature,
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
+        messages: vec![ChatMessage::User { content: prompt }],
         stream: false,
     }
 }
@@ -201,6 +260,54 @@ mod tests {
             error
                 .to_string()
                 .contains("chat request failed with status 401 Unauthorized")
+        );
+    }
+
+    #[test]
+    fn maps_agent_messages_to_chat_messages() {
+        let messages = vec![
+            AgentMessage::User("add 2 and 3".to_string()),
+            AgentMessage::ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":2,"b":3}"#.to_string(),
+            },
+            AgentMessage::ToolResult {
+                tool_call_id: "call-1".to_string(),
+                name: "add".to_string(),
+                output: "5".to_string(),
+            },
+        ];
+
+        let value = serde_json::to_value(build_chat_messages(&messages)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "role": "user",
+                    "content": "add 2 and 3"
+                },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": r#"{"a":2,"b":3}"#
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "5"
+                }
+            ])
         );
     }
 }
