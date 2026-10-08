@@ -3,14 +3,26 @@ use anyhow::{Context, Result, bail};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ModelDecision {
     FinalAnswer(String),
-    ToolCall { name: String, input: String },
+    ToolCall {
+        id: String,
+        name: String,
+        input: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum AgentMessage {
     User(String),
-    ToolCall { name: String, input: String },
-    ToolResult { name: String, output: String },
+    ToolCall {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        tool_call_id: String,
+        name: String,
+        output: String,
+    },
 }
 
 pub(crate) trait AgentModel {
@@ -62,17 +74,22 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
         let decision = model.next_decision(&state.messages).await?;
         match decision {
             ModelDecision::FinalAnswer(answer) => return Ok(answer),
-            ModelDecision::ToolCall { name, input } => {
+            ModelDecision::ToolCall { id, name, input } => {
                 let output = tool_executor
                     .execute(&name, &input)
                     .await
                     .with_context(|| format!("tool `{name}` execution failed"))?;
                 state.messages.push(AgentMessage::ToolCall {
+                    id: id.clone(),
                     name: name.clone(),
                     input,
                 });
 
-                let result = AgentMessage::ToolResult { name: name, output };
+                let result = AgentMessage::ToolResult {
+                    tool_call_id: id,
+                    name: name,
+                    output,
+                };
                 state.messages.push(result);
             }
         }
@@ -165,6 +182,7 @@ mod tests {
     async fn fake_model_returns_decisions_in_order() {
         let mut model = FakeModel::new(vec![
             ModelDecision::ToolCall {
+                id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
             },
@@ -178,6 +196,7 @@ mod tests {
         assert_eq!(
             first,
             ModelDecision::ToolCall {
+                id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
             }
@@ -222,6 +241,7 @@ mod tests {
     async fn agent_executes_tool_then_returns_final_answer() {
         let mut model = FakeModel::new(vec![
             ModelDecision::ToolCall {
+                id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
             },
@@ -245,10 +265,12 @@ mod tests {
                 vec![
                     AgentMessage::User("hello".to_string()),
                     AgentMessage::ToolCall {
+                        id: "call-1".to_string(),
                         name: "add".to_string(),
                         input: "2,3".to_string(),
                     },
                     AgentMessage::ToolResult {
+                        tool_call_id: "call-1".to_string(),
                         name: "add".to_string(),
                         output: "5".to_string(),
                     }
@@ -260,6 +282,7 @@ mod tests {
     #[tokio::test]
     async fn stops_after_reaching_max_iterations() {
         let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
+            id: "call-1".to_string(),
             name: "add".to_string(),
             input: "2,3".to_string(),
         }]);
@@ -296,6 +319,7 @@ mod tests {
     #[tokio::test]
     async fn returns_error_when_tool_execution_fails() {
         let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
+            id: "call-1".to_string(),
             name: "add".to_string(),
             input: "2,3".to_string(),
         }]);
@@ -329,6 +353,7 @@ mod tests {
     async fn agent_uses_builtin_add_tool() {
         let mut model = FakeModel::new(vec![
             ModelDecision::ToolCall {
+                id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: r#"{"a":2,"b":3}"#.to_string(),
             },
@@ -349,10 +374,12 @@ mod tests {
             vec![
                 AgentMessage::User("add 2 and 3".to_string()),
                 AgentMessage::ToolCall {
+                    id: "call-1".to_string(),
                     name: "add".to_string(),
                     input: r#"{"a":2,"b":3}"#.to_string(),
                 },
                 AgentMessage::ToolResult {
+                    tool_call_id: "call-1".to_string(),
                     name: "add".to_string(),
                     output: "5".to_string(),
                 },
