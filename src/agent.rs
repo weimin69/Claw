@@ -86,6 +86,7 @@ pub(crate) trait ToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::BuiltinToolExecutor;
     use std::collections::VecDeque;
 
     struct FakeToolExecutor {
@@ -320,6 +321,41 @@ mod tests {
             vec![
                 "tool `add` execution failed".to_string(),
                 "tool execution failed".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_uses_builtin_add_tool() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCall {
+                name: "add".to_string(),
+                input: r#"{"a":2,"b":3}"#.to_string(),
+            },
+            ModelDecision::FinalAnswer("5".to_string()),
+        ]);
+
+        let mut tool_executor = BuiltinToolExecutor;
+
+        let result = run_agent(&mut model, "add 2 and 3".to_string(), 2, &mut tool_executor)
+            .await
+            .unwrap();
+
+        assert_eq!(result, "5");
+        assert_eq!(model.received_messages.len(), 2);
+
+        assert_eq!(
+            model.received_messages[1],
+            vec![
+                AgentMessage::User("add 2 and 3".to_string()),
+                AgentMessage::ToolCall {
+                    name: "add".to_string(),
+                    input: r#"{"a":2,"b":3}"#.to_string(),
+                },
+                AgentMessage::ToolResult {
+                    name: "add".to_string(),
+                    output: "5".to_string(),
+                },
             ]
         );
     }

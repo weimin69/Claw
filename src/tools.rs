@@ -65,4 +65,22 @@ mod tests {
 
         assert_eq!(error.to_string(), "add result overflow");
     }
+
+    #[tokio::test]
+    async fn builtin_executor_runs_add_tool() {
+        let mut executor = BuiltinToolExecutor;
+
+        let output = executor.execute("add", r#"{"a":2,"b":3}"#).await.unwrap();
+
+        assert_eq!(output, "5");
+    }
+
+    #[tokio::test]
+    async fn builtin_executor_rejects_unknown_tool() {
+        let mut executor = BuiltinToolExecutor;
+
+        let error = executor.execute("weather", "{}").await.unwrap_err();
+
+        assert_eq!(error.to_string(), "unknown tool `weather`");
+    }
 }
