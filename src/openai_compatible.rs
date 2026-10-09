@@ -1,6 +1,6 @@
 //! Client behavior for the OpenAI-compatible Chat Completions protocol.
 
-use crate::agent::AgentMessage;
+use crate::agent::{AgentMessage, ModelDecision};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,8 @@ struct ChatRequest {
     temperature: f64,
     messages: Vec<ChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatTool>,
 }
 
 #[derive(Serialize)]
@@ -32,6 +34,20 @@ enum ChatMessage {
 }
 
 #[derive(Serialize)]
+struct ChatTool {
+    #[serde(rename = "type")]
+    kind: String,
+    function: ChatFunctionDefinition,
+}
+
+#[derive(Serialize)]
+struct ChatFunctionDefinition {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize)]
 struct ChatToolCall {
     id: String,
 
@@ -41,7 +57,7 @@ struct ChatToolCall {
     function: ChatFunctionCall,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ChatFunctionCall {
     name: String,
     arguments: String,
@@ -60,6 +76,38 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct AssistantMessage {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ChatToolCall>,
+}
+
+pub(crate) struct OpenAiCompatibleAgentModel {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    temperature: f64,
+}
+
+impl OpenAiCompatibleAgentModel {
+    pub(crate) fn new(
+        base_url: String,
+        api_key: String,
+        model: String,
+        temperature: f64,
+    ) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("failed to build HTTP client")?;
+
+        Ok(Self {
+            client,
+            base_url,
+            api_key,
+            model,
+            temperature,
+        })
+    }
 }
 
 pub async fn send_chat_request(
@@ -104,6 +152,29 @@ fn ensure_success_status(status: reqwest::StatusCode) -> Result<()> {
     Ok(())
 }
 
+fn build_add_tool() -> ChatTool {
+    ChatTool {
+        kind: "function".to_string(),
+        function: ChatFunctionDefinition {
+            name: "add".to_string(),
+            description: "Add two integers".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "a": {
+                        "type": "integer"
+                    },
+                    "b": {
+                        "type": "integer"
+                    }
+                },
+                "required": ["a", "b"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
 fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
@@ -136,6 +207,50 @@ fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
+fn build_agent_chat_request(
+    model: String,
+    temperature: f64,
+    messages: &[AgentMessage],
+) -> ChatRequest {
+    ChatRequest {
+        model,
+        temperature,
+        messages: build_chat_messages(messages),
+        stream: false,
+        tools: vec![build_add_tool()],
+    }
+}
+
+fn parse_agent_decision(text: &str) -> Result<ModelDecision> {
+    let chat_response: ChatResponse =
+        serde_json::from_str(text).context("failed to parse agent response")?;
+
+    let choice = chat_response
+        .choices
+        .first()
+        .context("agent response did not contain any choices")?;
+
+    if choice.message.tool_calls.len() > 1 {
+        bail!("multiple tool calls are not supported");
+    }
+
+    if let Some(tool_call) = choice.message.tool_calls.first() {
+        return Ok(ModelDecision::ToolCall {
+            id: tool_call.id.clone(),
+            name: tool_call.function.name.clone(),
+            input: tool_call.function.arguments.clone(),
+        });
+    }
+
+    let content = choice
+        .message
+        .content
+        .as_ref()
+        .context("agent response did not contain a tool call or final answer")?;
+
+    Ok(ModelDecision::FinalAnswer(content.clone()))
+}
+
 fn parse_chat_response(text: &str) -> Result<String> {
     let chat_response: ChatResponse =
         serde_json::from_str(text).context("failed to parse chat response")?;
@@ -160,6 +275,7 @@ fn build_chat_request(model: String, temperature: f64, prompt: String) -> ChatRe
         temperature,
         messages: vec![ChatMessage::User { content: prompt }],
         stream: false,
+        tools: Vec::new(),
     }
 }
 
@@ -309,5 +425,128 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn builds_add_tool_definition() {
+        let tool = build_add_tool();
+        let value = serde_json::to_value(tool).unwrap();
+
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["function"]["name"], "add");
+        assert_eq!(value["function"]["parameters"]["type"], "object");
+
+        assert_eq!(
+            value["function"]["parameters"]["properties"]["a"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            value["function"]["parameters"]["properties"]["b"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            value["function"]["parameters"]["required"],
+            serde_json::json!(["a", "b"])
+        );
+        assert_eq!(
+            value["function"]["parameters"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn builds_agent_chat_request_with_history_and_tools() {
+        let messages = vec![AgentMessage::User("add 2 and 3".to_string())];
+
+        let request = build_agent_chat_request("gpt-4.1".to_string(), 0.7, &messages);
+
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["model"], "gpt-4.1");
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "add 2 and 3");
+        assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["function"]["name"], "add");
+    }
+
+    #[test]
+    fn parses_tool_call_as_agent_decision() {
+        let decision = parse_agent_decision(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{\"a\":2,\"b\":3}"
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            ModelDecision::ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":2,"b":3}"#.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_final_answer_as_agent_decision() {
+        let decision = parse_agent_decision(
+            r#"{
+                "choices": [{
+                    "message": {
+                        "content": "done"
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(decision, ModelDecision::FinalAnswer("done".to_string()));
+    }
+
+    #[test]
+    fn rejects_multiple_tool_calls() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{\"a\":1,\"b\":2}"
+                            }
+                        },
+                        {
+                            "id": "call-2",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{\"a\":3,\"b\":4}"
+                            }
+                        }
+                    ]
+                }
+            }]
+        })
+        .to_string();
+
+        let error = parse_agent_decision(&response).unwrap_err();
+
+        assert_eq!(error.to_string(), "multiple tool calls are not supported");
     }
 }

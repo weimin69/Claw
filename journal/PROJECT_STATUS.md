@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了 BuiltinToolExecutor 的直接分发测试和确定性 Runtime 接入，Agent 模块现有 11 个测试、工具模块现有 6 个测试。为 ToolCall 与 ToolResult 增加了关联 ID，并开始实现 OpenAI-compatible Tool Calling 协议适配：ChatMessage 已改为角色 enum，AgentMessage 可映射为 user、assistant tool_calls 和 tool 消息。当前 OpenAI-compatible 模块 8 个测试通过；完整 Agent 请求、响应决策解析和真实 AgentModel 适配器仍待完成。
+最近一次学习中，完成了 OpenAI-compatible Agent 请求与响应的核心协议转换：完整 AgentMessage 历史可映射为 provider 消息，请求可携带 `add` function tool 及 JSON Schema，响应可转换为 FinalAnswer 或带关联 ID 的 ToolCall。当前明确拒绝单轮多个工具调用，避免静默丢失；`OpenAiCompatibleAgentModel` 结构体及 client 复用构造函数已经建立，但 `AgentModel` trait 实现和 CLI 接入尚未开始。由于已有代码量开始影响整体理解，接下来暂停所有新功能，优先对整个项目进行逐文件、逐行复习。
 
 ## Completed
 
@@ -341,20 +341,20 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能把完整 AgentMessage 历史映射成 provider 协议消息，但现有 HTTP 入口仍只接收单个 prompt，响应也仍只解析 content；下一步继续完成请求工具定义、tool_calls 响应解析和 AgentModel 适配。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能构造带完整历史和 `add` 工具定义的 Agent 请求，也能把 provider 的 content / tool_calls 响应转换为 ModelDecision；真实 `AgentModel` trait 实现尚未完成。当前学习重点已从继续开发切换为理解和复习已有代码。
 
 ## Next Step
 
-下一步完成 OpenAI-compatible AgentModel 的协议适配：
+明后天只复习整个项目，不安排任何新功能：
 
-- 让 Agent 请求构造器接收完整消息历史
-- 在请求中加入 `add` function tool 的 JSON Schema
-- 扩展响应 DTO，同时表达 content 与 tool_calls
-- 将响应转换为 FinalAnswer 或带关联 ID 的 ToolCall
-- 使用纯序列化/反序列化测试固定协议契约
-- 最后实现 AgentModel 并接入现有 HTTP 请求路径
+- 从 `Cargo.toml`、模块树、`main.rs` 和 CLI 分发开始，建立全局执行路径
+- 按模块逐文件逐行解释已有生产代码
+- 说明每个类型、函数、字段和 trait 的职责、调用者及设计原因
+- 梳理所有权、错误传播、异步边界、Agent Loop 和协议转换
+- 按行为边界复习测试，明确每个测试证明什么以及是否存在重复
+- 建立“不理解代码清单”，通过复述、修改和调试逐项掌握
 
-继续坚持最小边界。暂不实现单轮多工具调用、多工具并发、插件注册表、持久化或规划/反思。
+复习完成前，不继续实现 `AgentModel` trait、不接入 CLI，也不引入多工具并发、插件、持久化或其他新能力。
 
 ## Architecture Notes
 
@@ -432,6 +432,7 @@ temperature = 0.7
 - 后续是否需要显式取消仍在运行的兄弟 Task？
 - 两个 wait-all Task 同时失败时，应该只返回固定顺序的第一个错误，还是聚合多个错误？
 - `AgentModel` 与 `ToolExecutor` 的原生 async trait 在需要 trait object 前是否继续保持泛型使用？
+- 完整项目复习后，哪些现有代码仍无法独立解释、修改或调试？
 
 ## Technical Debt
 
@@ -447,13 +448,12 @@ temperature = 0.7
 - CLI 日志、tracing、verbose、其他命令集成测试与发布打磨尚未完成，将按 Agent 开发需求推进
 - 当前没有 `--verbose` 或日志系统，调试 provider 错误 body 不方便
 - Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
-- OpenAI-compatible Agent 请求尚未使用完整 AgentMessage 历史和工具定义
-- provider tool_calls 响应尚未转换为 ModelDecision
-- OpenAI-compatible AgentModel 尚未实现，Runtime 仍未接入 CLI
+- OpenAI-compatible AgentModel 只有结构体和构造函数，尚未实现 `AgentModel` trait，Runtime 仍未接入 CLI
 - 当前每个 ModelDecision 只表达一次 ToolCall，尚不支持模型单轮返回多个工具调用
+- 当前对完整项目代码的理解不均衡；继续开发前需要完成逐文件、逐行复习
 
 ## Next TODO
 
-- [ ] 构造包含完整历史和工具定义的 Agent 请求
-- [ ] 解析 provider 的 FinalAnswer 与 ToolCall 响应
-- [ ] 实现并测试 OpenAI-compatible AgentModel 适配器
+- [ ] 按程序入口和模块依赖顺序完整复习项目
+- [ ] 逐行解释已有生产代码并记录仍不理解的位置
+- [ ] 逐类梳理测试保护的行为边界，删除或合并确有重复的测试
