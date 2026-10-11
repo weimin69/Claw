@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-最近一次学习中，完成了 OpenAI-compatible Agent 请求与响应的核心协议转换：完整 AgentMessage 历史可映射为 provider 消息，请求可携带 `add` function tool 及 JSON Schema，响应可转换为 FinalAnswer 或带关联 ID 的 ToolCall。当前明确拒绝单轮多个工具调用，避免静默丢失；`OpenAiCompatibleAgentModel` 结构体及 client 复用构造函数已经建立，但 `AgentModel` trait 实现和 CLI 接入尚未开始。由于已有代码量开始影响整体理解，接下来暂停所有新功能，优先对整个项目进行逐文件、逐行复习。
+OpenAI-compatible Agent 请求与响应的核心协议转换已经完成：完整 AgentMessage 历史可映射为 provider 消息，请求可携带 `add` function tool 及 JSON Schema，响应可转换为 FinalAnswer 或带关联 ID 的 ToolCall。当前明确拒绝单轮多个工具调用，避免静默丢失；`OpenAiCompatibleAgentModel` 结构体及 client 复用构造函数已经建立，但 `AgentModel` trait 实现和 CLI 接入尚未开始。最近一次学习已从 `main.rs`、模块树、异步命令分发、错误链和 `config.rs` 开始全项目复习；下一次从 `chat.rs` 的输入来源与所有权继续，复习完成前不开发新功能。
 
 ## Completed
 
@@ -248,6 +248,13 @@
 - 实现 AgentMessage 到 OpenAI-compatible 三类消息的映射
 - 为完整消息映射添加 JSON 序列化测试
 - 当前 OpenAI-compatible 模块 8 个测试通过
+- 复习并能基本说明 `main()`、`run()` 与命令 `execute()` 的职责边界
+- 复习 `mod` 注册模块与 `pub` 控制可见性的区别
+- 复习同步和异步命令在同一 `match` 中共存的类型原因
+- 复习 Future、`.await`、`?`、Tokio Task 与 worker thread 的基本关系
+- 复习 `anyhow` 错误链、`bail!()`、`.context()` 与 `.with_context()` 的职责
+- 复习配置读取、TOML 解析、默认值、环境变量 fallback 和业务校验的顺序
+- 明确当前 API key 优先级为非空 TOML、非空环境变量、空字符串
 
 ## In Progress
 
@@ -341,13 +348,15 @@
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能构造带完整历史和 `add` 工具定义的 Agent 请求，也能把 provider 的 content / tool_calls 响应转换为 ModelDecision；真实 `AgentModel` trait 实现尚未完成。当前学习重点已从继续开发切换为理解和复习已有代码。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能构造带完整历史和 `add` 工具定义的 Agent 请求，也能把 provider 的 content / tool_calls 响应转换为 ModelDecision；真实 `AgentModel` trait 实现尚未完成。当前学习重点仍是理解和复习已有代码；已复习入口、模块树、异步分发、错误传播和配置流水线，下一部分是 `chat.rs`。
 
 ## Next Step
 
-明后天只复习整个项目，不安排任何新功能：
+继续只复习整个项目，不安排任何新功能：
 
-- 从 `Cargo.toml`、模块树、`main.rs` 和 CLI 分发开始，建立全局执行路径
+- 从 `src/commands/chat.rs` 继续，梳理命令行 prompt、stdin fallback、空白校验和配置加载路径
+- 解释 prompt、配置字段和请求参数之间的所有权移动与借用
+- 对照 `chat` 单元测试及 CLI 集成测试，说明每个测试保护的行为边界
 - 按模块逐文件逐行解释已有生产代码
 - 说明每个类型、函数、字段和 trait 的职责、调用者及设计原因
 - 梳理所有权、错误传播、异步边界、Agent Loop 和协议转换
@@ -454,6 +463,6 @@ temperature = 0.7
 
 ## Next TODO
 
-- [ ] 按程序入口和模块依赖顺序完整复习项目
-- [ ] 逐行解释已有生产代码并记录仍不理解的位置
-- [ ] 逐类梳理测试保护的行为边界，删除或合并确有重复的测试
+- [ ] 逐行复习 `src/commands/chat.rs` 的输入选择与校验流程
+- [ ] 解释 prompt 在各函数之间的所有权移动与借用
+- [ ] 对照相关单元测试和 CLI 集成测试说明每个行为边界
