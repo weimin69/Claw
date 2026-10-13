@@ -18,7 +18,7 @@
 
 项目已经完成基础多命令 CLI、`run()` / `main()` 职责拆分、`anyhow::Result<()>` 错误模型、配置读取/解析/默认值/校验、基础单元测试、`tokio` 异步入口、`fetch` HTTP GET 练习、第一版 `chat` 命令，以及第一批 CLI 集成测试。
 
-OpenAI-compatible Agent 请求与响应的核心协议转换已经完成：完整 AgentMessage 历史可映射为 provider 消息，请求可携带 `add` function tool 及 JSON Schema，响应可转换为 FinalAnswer 或带关联 ID 的 ToolCall。当前明确拒绝单轮多个工具调用，避免静默丢失；`OpenAiCompatibleAgentModel` 结构体及 client 复用构造函数已经建立，但 `AgentModel` trait 实现和 CLI 接入尚未开始。最近一次学习已从 `main.rs`、模块树、异步命令分发、错误链和 `config.rs` 开始全项目复习；下一次从 `chat.rs` 的输入来源与所有权继续，复习完成前不开发新功能。
+OpenAI-compatible Agent 请求与响应的核心协议转换已经完成：完整 AgentMessage 历史可映射为 provider 消息，请求可携带 `add` function tool 及 JSON Schema，响应可转换为 FinalAnswer 或带关联 ID 的 ToolCall。当前明确拒绝单轮多个工具调用，避免静默丢失；`OpenAiCompatibleAgentModel` 结构体及 client 复用构造函数已经建立，但 `AgentModel` trait 实现和 CLI 接入尚未开始。全项目专项复习现已停止；下一次恢复 Stage 6 开发，从实现真实 `AgentModel` 适配器继续。
 
 ## Completed
 
@@ -255,6 +255,11 @@ OpenAI-compatible Agent 请求与响应的核心协议转换已经完成：完�
 - 复习 `anyhow` 错误链、`bail!()`、`.context()` 与 `.with_context()` 的职责
 - 复习配置读取、TOML 解析、默认值、环境变量 fallback 和业务校验的顺序
 - 明确当前 API key 优先级为非空 TOML、非空环境变量、空字符串
+- 复习 `chat::execute()` 的 prompt 选择、空白校验、配置加载和请求调用链
+- 明确 `?` 会提前传播 `Err`，不会触发 panic
+- 复习 `String` 移动、字符串借用和 `Copy` 数值在 chat 请求参数中的区别
+- 复习 chat 成功、缺少 key、Provider 非 2xx 和环境变量 fallback 的集成测试边界
+- 开始复习 `fetch::execute()` 的 HTTP client、网络错误与 status 错误边界
 
 ## In Progress
 
@@ -348,22 +353,19 @@ OpenAI-compatible Agent 请求与响应的核心协议转换已经完成：完�
 - `read_to_string()`
 - 输入来源选择后的统一业务校验
 
-当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能构造带完整历史和 `add` 工具定义的 Agent 请求，也能把 provider 的 content / tool_calls 响应转换为 ModelDecision；真实 `AgentModel` trait 实现尚未完成。当前学习重点仍是理解和复习已有代码；已复习入口、模块树、异步分发、错误传播和配置流水线，下一部分是 `chat.rs`。
+当前 `agent.rs` 已形成第一版单工具 Agent Runtime，并使用关联 ID 连接 ToolCall 与 ToolResult。`tools.rs` 承载具体内置工具与名称分发。`openai_compatible.rs` 已能构造带完整历史和 `add` 工具定义的 Agent 请求，也能把 provider 的 content / tool_calls 响应转换为 ModelDecision；真实 `AgentModel` trait 实现尚未完成。专项复习已经结束，学习重点重新切换为完成 AgentModel 适配和后续 CLI 接入。
 
 ## Next Step
 
-继续只复习整个项目，不安排任何新功能：
+恢复 Stage 6 的 Agent Runtime 开发：
 
-- 从 `src/commands/chat.rs` 继续，梳理命令行 prompt、stdin fallback、空白校验和配置加载路径
-- 解释 prompt、配置字段和请求参数之间的所有权移动与借用
-- 对照 `chat` 单元测试及 CLI 集成测试，说明每个测试保护的行为边界
-- 按模块逐文件逐行解释已有生产代码
-- 说明每个类型、函数、字段和 trait 的职责、调用者及设计原因
-- 梳理所有权、错误传播、异步边界、Agent Loop 和协议转换
-- 按行为边界复习测试，明确每个测试证明什么以及是否存在重复
-- 建立“不理解代码清单”，通过复述、修改和调试逐项掌握
+- 为 `OpenAiCompatibleAgentModel` 实现 `AgentModel` trait
+- 在 `next_decision()` 中复用现有 client，发送包含完整历史和工具定义的请求
+- 复用 `ensure_success_status()` 与 `parse_agent_decision()` 处理响应
+- 使用确定性测试验证 FinalAnswer、ToolCall 和错误路径
+- 适配器稳定后，再评估将现有 Agent Runtime 接入 CLI
 
-复习完成前，不继续实现 `AgentModel` trait、不接入 CLI，也不引入多工具并发、插件、持久化或其他新能力。
+继续保持最小单工具边界；暂不引入多工具并发、插件、持久化、规划或反思。
 
 ## Architecture Notes
 
@@ -459,10 +461,11 @@ temperature = 0.7
 - Agent Runtime 尚未接入 CLI，普通构建存在 dead-code 警告
 - OpenAI-compatible AgentModel 只有结构体和构造函数，尚未实现 `AgentModel` trait，Runtime 仍未接入 CLI
 - 当前每个 ModelDecision 只表达一次 ToolCall，尚不支持模型单轮返回多个工具调用
-- 当前对完整项目代码的理解不均衡；继续开发前需要完成逐文件、逐行复习
+- 当前对完整项目代码的理解仍不均衡，后续在功能开发和调试过程中按需补充讲解
+- `chat_rejects_missing_api_key` 未显式移除子进程继承的 `AGENT_CLI_LLM_API_KEY`，可能受宿主环境影响
 
 ## Next TODO
 
-- [ ] 逐行复习 `src/commands/chat.rs` 的输入选择与校验流程
-- [ ] 解释 prompt 在各函数之间的所有权移动与借用
-- [ ] 对照相关单元测试和 CLI 集成测试说明每个行为边界
+- [ ] 实现 `AgentModel::next_decision()` 的 HTTP 请求流程
+- [ ] 为真实模型适配器添加确定性测试
+- [ ] 在测试通过后评估 Agent Runtime 的 CLI 接入
