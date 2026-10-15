@@ -1,7 +1,8 @@
 //! Client behavior for the OpenAI-compatible Chat Completions protocol.
 
-use crate::agent::{AgentMessage, ModelDecision};
+use crate::agent::{AgentMessage,AgentModel, ModelDecision};
 use anyhow::{Context, Result, bail};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -108,6 +109,36 @@ impl OpenAiCompatibleAgentModel {
             temperature,
         })
     }
+}
+
+impl AgentModel for OpenAiCompatibleAgentModel {
+    async fn next_decision(&mut self, messages: &[AgentMessage]) -> Result<ModelDecision> {
+        let request = build_agent_chat_request(self.model.clone(), self.temperature, messages);
+
+        let url = format!("{}/chat/completions",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+                      .client
+                      .post(url)
+                      .bearer_auth(&self.api_key)
+                      .json(&request)
+                      .send()
+                      .await
+                      .context("failed to send agent request")?;
+
+                  let status = response.status();
+
+                  let text = response
+                      .text()
+                      .await
+                      .context("failed to read agent response body")?;
+
+                  ensure_success_status(status)?;
+
+                  parse_agent_decision(&text)
+    }
+
 }
 
 pub async fn send_chat_request(

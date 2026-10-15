@@ -29,30 +29,10 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Hello { name, age } => {
-            commands::hello::execute(name, age)?;
-        }
-        Commands::Version => {
-            commands::version::execute()?;
-        }
-        Commands::Echo { words, upper } => {
-            commands::echo::execute(&words, upper)?;
-        }
-        Commands::Divide { dividend, divisor } => {
-            commands::divide::execute(dividend, divisor)?;
-        }
-        Commands::Sum { numbers } => {
-            commands::sum::execute(&numbers)?;
-        }
-        Commands::Repeat { words, times } => {
-            commands::repeat::execute(&words, times)?;
-        }
         Commands::ReadConfig { path } => {
             commands::read_config::execute(&path)?;
         }
-        Commands::Wait { seconds } => {
-            commands::wait::execute(seconds).await?;
-        }
+
         Commands::Fetch { url, max_chars } => {
             commands::fetch::execute(&url, max_chars).await?;
         }
@@ -61,12 +41,6 @@ async fn run() -> Result<()> {
             prompt,
         } => {
             commands::chat::execute(&config_path, prompt).await?;
-        }
-        Commands::ParallelWait {
-            first_seconds,
-            second_seconds,
-        } => {
-            commands::parallel_wait::execute(first_seconds, second_seconds).await?;
         }
     }
     Ok(())
