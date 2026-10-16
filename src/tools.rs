@@ -1,15 +1,20 @@
-use crate::agent::ToolExecutor;
-use anyhow::{Context, Result, anyhow, bail};
+use crate::agent::{ToolExecutor, ToolOutput};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
 pub(crate) struct BuiltinToolExecutor;
 
 impl ToolExecutor for BuiltinToolExecutor {
-    async fn execute(&mut self, name: &str, input: &str) -> Result<String> {
-        match name {
+    async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
+        let result = match name {
             "add" => execute_add(input),
-            _ => bail!("unknown tool `{name}`"),
-        }
+            _ => return Ok(ToolOutput::error(format!("unknown tool `{name}`"))),
+        };
+
+        Ok(match result {
+            Ok(output) => ToolOutput::success(output),
+            Err(error) => ToolOutput::error(error.to_string()),
+        })
     }
 }
 
@@ -72,15 +77,30 @@ mod tests {
 
         let output = executor.execute("add", r#"{"a":2,"b":3}"#).await.unwrap();
 
-        assert_eq!(output, "5");
+        assert_eq!(output, ToolOutput::success("5".to_string()));
     }
 
     #[tokio::test]
-    async fn builtin_executor_rejects_unknown_tool() {
+    async fn builtin_executor_returns_recoverable_error_for_unknown_tool() {
         let mut executor = BuiltinToolExecutor;
 
-        let error = executor.execute("weather", "{}").await.unwrap_err();
+        let output = executor.execute("weather", "{}").await.unwrap();
 
-        assert_eq!(error.to_string(), "unknown tool `weather`");
+        assert_eq!(
+            output,
+            ToolOutput::error("unknown tool `weather`".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_executor_returns_recoverable_error_for_invalid_input() {
+        let mut executor = BuiltinToolExecutor;
+
+        let output = executor.execute("add", r#"{"a":2}"#).await.unwrap();
+
+        assert_eq!(
+            output,
+            ToolOutput::error("invalid add tool input".to_string())
+        );
     }
 }

@@ -42,6 +42,13 @@ async fn run() -> Result<()> {
         } => {
             commands::chat::execute(&config_path, prompt).await?;
         }
+        Commands::Claw {
+            config_path,
+            prompt,
+            max_iterations,
+        } => {
+            commands::claw::execute(&config_path, prompt, max_iterations).await?;
+        }
     }
     Ok(())
 }

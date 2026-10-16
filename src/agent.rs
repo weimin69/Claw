@@ -3,26 +3,48 @@ use anyhow::{Context, Result, bail};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ModelDecision {
     FinalAnswer(String),
-    ToolCall {
-        id: String,
-        name: String,
-        input: String,
-    },
+    ToolCalls(Vec<ToolCall>),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) input: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum AgentMessage {
     User(String),
-    ToolCall {
-        id: String,
-        name: String,
-        input: String,
-    },
+    AssistantToolCalls(Vec<ToolCall>),
     ToolResult {
         tool_call_id: String,
         name: String,
         output: String,
+        is_error: bool,
     },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct ToolOutput {
+    pub(crate) content: String,
+    pub(crate) is_error: bool,
+}
+
+impl ToolOutput {
+    pub(crate) fn success(content: String) -> Self {
+        Self {
+            content,
+            is_error: false,
+        }
+    }
+
+    pub(crate) fn error(content: String) -> Self {
+        Self {
+            content,
+            is_error: true,
+        }
+    }
 }
 
 pub(crate) trait AgentModel {
@@ -74,30 +96,35 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
         let decision = model.next_decision(&state.messages).await?;
         match decision {
             ModelDecision::FinalAnswer(answer) => return Ok(answer),
-            ModelDecision::ToolCall { id, name, input } => {
-                let output = tool_executor
-                    .execute(&name, &input)
-                    .await
-                    .with_context(|| format!("tool `{name}` execution failed"))?;
-                state.messages.push(AgentMessage::ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input,
-                });
+            ModelDecision::ToolCalls(tool_calls) => {
+                if tool_calls.is_empty() {
+                    bail!("model returned an empty tool call list");
+                }
 
-                let result = AgentMessage::ToolResult {
-                    tool_call_id: id,
-                    name: name,
-                    output,
-                };
-                state.messages.push(result);
+                state
+                    .messages
+                    .push(AgentMessage::AssistantToolCalls(tool_calls.clone()));
+
+                for tool_call in tool_calls {
+                    let tool_output = tool_executor
+                        .execute(&tool_call.name, &tool_call.input)
+                        .await
+                        .with_context(|| format!("tool `{}` execution failed", tool_call.name))?;
+
+                    state.messages.push(AgentMessage::ToolResult {
+                        tool_call_id: tool_call.id,
+                        name: tool_call.name,
+                        output: tool_output.content,
+                        is_error: tool_output.is_error,
+                    });
+                }
             }
         }
     }
 }
 
 pub(crate) trait ToolExecutor {
-    async fn execute(&mut self, name: &str, input: &str) -> Result<String>;
+    async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput>;
 }
 
 #[cfg(test)]
@@ -107,12 +134,12 @@ mod tests {
     use std::collections::VecDeque;
 
     struct FakeToolExecutor {
-        output: String,
+        output: ToolOutput,
         calls: Vec<(String, String)>,
     }
 
     impl ToolExecutor for FakeToolExecutor {
-        async fn execute(&mut self, name: &str, input: &str) -> Result<String> {
+        async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
             self.calls.push((name.to_string(), input.to_string()));
             Ok(self.output.clone())
         }
@@ -181,11 +208,11 @@ mod tests {
     #[tokio::test]
     async fn fake_model_returns_decisions_in_order() {
         let mut model = FakeModel::new(vec![
-            ModelDecision::ToolCall {
+            ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
-            },
+            }]),
             ModelDecision::FinalAnswer("5".to_string()),
         ]);
 
@@ -195,11 +222,11 @@ mod tests {
 
         assert_eq!(
             first,
-            ModelDecision::ToolCall {
+            ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
-            }
+            }])
         );
 
         let answer = model.next_decision(&messages).await.unwrap();
@@ -214,7 +241,7 @@ mod tests {
         let mut model = FakeModel::new(vec![ModelDecision::FinalAnswer("done".to_string())]);
 
         let mut tool = FakeToolExecutor {
-            output: "5".to_string(),
+            output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
 
@@ -228,27 +255,27 @@ mod tests {
     #[tokio::test]
     async fn fake_tool_executor_records_call_and_returns_output() {
         let mut tool = FakeToolExecutor {
-            output: "5".to_string(),
+            output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
         let result = tool.execute("add", "2,3").await.unwrap();
 
-        assert_eq!(result, "5");
+        assert_eq!(result, ToolOutput::success("5".to_string()));
         assert_eq!(tool.calls, vec![("add".to_string(), "2,3".to_string())]);
     }
 
     #[tokio::test]
     async fn agent_executes_tool_then_returns_final_answer() {
         let mut model = FakeModel::new(vec![
-            ModelDecision::ToolCall {
+            ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: "2,3".to_string(),
-            },
+            }]),
             ModelDecision::FinalAnswer("5".to_string()),
         ]);
         let mut tool = FakeToolExecutor {
-            output: "5".to_string(),
+            output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
 
@@ -264,15 +291,16 @@ mod tests {
                 vec![AgentMessage::User("hello".to_string())],
                 vec![
                     AgentMessage::User("hello".to_string()),
-                    AgentMessage::ToolCall {
+                    AgentMessage::AssistantToolCalls(vec![ToolCall {
                         id: "call-1".to_string(),
                         name: "add".to_string(),
                         input: "2,3".to_string(),
-                    },
+                    }]),
                     AgentMessage::ToolResult {
                         tool_call_id: "call-1".to_string(),
                         name: "add".to_string(),
                         output: "5".to_string(),
+                        is_error: false,
                     }
                 ],
             ]
@@ -280,15 +308,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_executes_multiple_tool_calls_from_one_decision() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![
+                ToolCall {
+                    id: "call-1".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":1,"b":2}"#.to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":3,"b":4}"#.to_string(),
+                },
+            ]),
+            ModelDecision::FinalAnswer("3 and 7".to_string()),
+        ]);
+        let mut tool_executor = BuiltinToolExecutor;
+
+        let answer = run_agent(
+            &mut model,
+            "give two sums".to_string(),
+            2,
+            &mut tool_executor,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "3 and 7");
+        assert_eq!(
+            model.received_messages[1],
+            vec![
+                AgentMessage::User("give two sums".to_string()),
+                AgentMessage::AssistantToolCalls(vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "add".to_string(),
+                        input: r#"{"a":1,"b":2}"#.to_string(),
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "add".to_string(),
+                        input: r#"{"a":3,"b":4}"#.to_string(),
+                    },
+                ]),
+                AgentMessage::ToolResult {
+                    tool_call_id: "call-1".to_string(),
+                    name: "add".to_string(),
+                    output: "3".to_string(),
+                    is_error: false,
+                },
+                AgentMessage::ToolResult {
+                    tool_call_id: "call-2".to_string(),
+                    name: "add".to_string(),
+                    output: "7".to_string(),
+                    is_error: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_handles_mixed_success_and_recoverable_tool_errors() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![
+                ToolCall {
+                    id: "call-1".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":1,"b":2}"#.to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":3}"#.to_string(),
+                },
+            ]),
+            ModelDecision::FinalAnswer("one call failed".to_string()),
+        ]);
+        let mut tool_executor = BuiltinToolExecutor;
+
+        let answer = run_agent(
+            &mut model,
+            "run two calls".to_string(),
+            2,
+            &mut tool_executor,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "one call failed");
+        assert_eq!(
+            &model.received_messages[1][2..],
+            [
+                AgentMessage::ToolResult {
+                    tool_call_id: "call-1".to_string(),
+                    name: "add".to_string(),
+                    output: "3".to_string(),
+                    is_error: false,
+                },
+                AgentMessage::ToolResult {
+                    tool_call_id: "call-2".to_string(),
+                    name: "add".to_string(),
+                    output: "invalid add tool input".to_string(),
+                    is_error: true,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_tool_call_list() {
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(Vec::new())]);
+        let mut tool_executor = BuiltinToolExecutor;
+
+        let error = run_agent(&mut model, "hello".to_string(), 2, &mut tool_executor)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "model returned an empty tool call list");
+    }
+
+    #[tokio::test]
     async fn stops_after_reaching_max_iterations() {
-        let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![ToolCall {
             id: "call-1".to_string(),
             name: "add".to_string(),
             input: "2,3".to_string(),
-        }]);
+        }])]);
 
         let mut tool_executor = FakeToolExecutor {
-            output: "5".to_string(),
+            output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
 
@@ -309,7 +458,7 @@ mod tests {
     }
 
     impl ToolExecutor for FailingToolExecutor {
-        async fn execute(&mut self, name: &str, input: &str) -> Result<String> {
+        async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
             self.calls.push((name.to_string(), input.to_string()));
 
             bail!("tool execution failed");
@@ -317,12 +466,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_error_when_tool_execution_fails() {
-        let mut model = FakeModel::new(vec![ModelDecision::ToolCall {
+    async fn agent_stops_on_fatal_tool_executor_error() {
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![ToolCall {
             id: "call-1".to_string(),
             name: "add".to_string(),
             input: "2,3".to_string(),
-        }]);
+        }])]);
 
         let mut tool_executor = FailingToolExecutor { calls: Vec::new() };
 
@@ -352,11 +501,11 @@ mod tests {
     #[tokio::test]
     async fn agent_uses_builtin_add_tool() {
         let mut model = FakeModel::new(vec![
-            ModelDecision::ToolCall {
+            ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: r#"{"a":2,"b":3}"#.to_string(),
-            },
+            }]),
             ModelDecision::FinalAnswer("5".to_string()),
         ]);
 
@@ -373,17 +522,51 @@ mod tests {
             model.received_messages[1],
             vec![
                 AgentMessage::User("add 2 and 3".to_string()),
-                AgentMessage::ToolCall {
+                AgentMessage::AssistantToolCalls(vec![ToolCall {
                     id: "call-1".to_string(),
                     name: "add".to_string(),
                     input: r#"{"a":2,"b":3}"#.to_string(),
-                },
+                }]),
                 AgentMessage::ToolResult {
                     tool_call_id: "call-1".to_string(),
                     name: "add".to_string(),
                     output: "5".to_string(),
+                    is_error: false,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_returns_recoverable_tool_error_to_model() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":2}"#.to_string(),
+            }]),
+            ModelDecision::FinalAnswer("The tool input was invalid".to_string()),
+        ]);
+        let mut tool_executor = BuiltinToolExecutor;
+
+        let answer = run_agent(
+            &mut model,
+            "add with invalid input".to_string(),
+            2,
+            &mut tool_executor,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "The tool input was invalid");
+        assert_eq!(
+            model.received_messages[1].last(),
+            Some(&AgentMessage::ToolResult {
+                tool_call_id: "call-1".to_string(),
+                name: "add".to_string(),
+                output: "invalid add tool input".to_string(),
+                is_error: true,
+            })
         );
     }
 }

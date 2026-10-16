@@ -1,8 +1,7 @@
 //! Client behavior for the OpenAI-compatible Chat Completions protocol.
 
-use crate::agent::{AgentMessage,AgentModel, ModelDecision};
+use crate::agent::{AgentMessage, AgentModel, ModelDecision, ToolCall};
 use anyhow::{Context, Result, bail};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -115,30 +114,27 @@ impl AgentModel for OpenAiCompatibleAgentModel {
     async fn next_decision(&mut self, messages: &[AgentMessage]) -> Result<ModelDecision> {
         let request = build_agent_chat_request(self.model.clone(), self.temperature, messages);
 
-        let url = format!("{}/chat/completions",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self
-                      .client
-                      .post(url)
-                      .bearer_auth(&self.api_key)
-                      .json(&request)
-                      .send()
-                      .await
-                      .context("failed to send agent request")?;
+            .client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .await
+            .context("failed to send agent request")?;
 
-                  let status = response.status();
+        let status = response.status();
 
-                  let text = response
-                      .text()
-                      .await
-                      .context("failed to read agent response body")?;
+        let text = response
+            .text()
+            .await
+            .context("failed to read agent response body")?;
 
-                  ensure_success_status(status)?;
+        ensure_success_status(status)?;
 
-                  parse_agent_decision(&text)
+        parse_agent_decision(&text)
     }
-
 }
 
 pub async fn send_chat_request(
@@ -214,25 +210,33 @@ fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
                 content: content.clone(),
             },
 
-            AgentMessage::ToolCall { id, name, input } => ChatMessage::Assistant {
+            AgentMessage::AssistantToolCalls(tool_calls) => ChatMessage::Assistant {
                 content: None,
-                tool_calls: vec![ChatToolCall {
-                    id: id.clone(),
-                    kind: "function".to_string(),
-                    function: ChatFunctionCall {
-                        name: name.clone(),
-                        arguments: input.clone(),
-                    },
-                }],
+                tool_calls: tool_calls
+                    .iter()
+                    .map(|tool_call| ChatToolCall {
+                        id: tool_call.id.clone(),
+                        kind: "function".to_string(),
+                        function: ChatFunctionCall {
+                            name: tool_call.name.clone(),
+                            arguments: tool_call.input.clone(),
+                        },
+                    })
+                    .collect(),
             },
 
             AgentMessage::ToolResult {
                 tool_call_id,
                 output,
+                is_error,
                 ..
             } => ChatMessage::Tool {
                 tool_call_id: tool_call_id.clone(),
-                content: output.clone(),
+                content: if *is_error {
+                    serde_json::json!({ "error": output }).to_string()
+                } else {
+                    output.clone()
+                },
             },
         })
         .collect()
@@ -261,16 +265,19 @@ fn parse_agent_decision(text: &str) -> Result<ModelDecision> {
         .first()
         .context("agent response did not contain any choices")?;
 
-    if choice.message.tool_calls.len() > 1 {
-        bail!("multiple tool calls are not supported");
-    }
+    if !choice.message.tool_calls.is_empty() {
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .iter()
+            .map(|tool_call| ToolCall {
+                id: tool_call.id.clone(),
+                name: tool_call.function.name.clone(),
+                input: tool_call.function.arguments.clone(),
+            })
+            .collect();
 
-    if let Some(tool_call) = choice.message.tool_calls.first() {
-        return Ok(ModelDecision::ToolCall {
-            id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
-            input: tool_call.function.arguments.clone(),
-        });
+        return Ok(ModelDecision::ToolCalls(tool_calls));
     }
 
     let content = choice
@@ -313,6 +320,8 @@ fn build_chat_request(model: String, temperature: f64, prompt: String) -> ChatRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn builds_chat_request() {
@@ -414,15 +423,16 @@ mod tests {
     fn maps_agent_messages_to_chat_messages() {
         let messages = vec![
             AgentMessage::User("add 2 and 3".to_string()),
-            AgentMessage::ToolCall {
+            AgentMessage::AssistantToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: r#"{"a":2,"b":3}"#.to_string(),
-            },
+            }]),
             AgentMessage::ToolResult {
                 tool_call_id: "call-1".to_string(),
                 name: "add".to_string(),
                 output: "5".to_string(),
+                is_error: false,
             },
         ];
 
@@ -455,6 +465,51 @@ mod tests {
                     "content": "5"
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn maps_multiple_tool_calls_to_one_assistant_message() {
+        let messages = vec![AgentMessage::AssistantToolCalls(vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":1,"b":2}"#.to_string(),
+            },
+            ToolCall {
+                id: "call-2".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":3,"b":4}"#.to_string(),
+            },
+        ])];
+
+        let value = serde_json::to_value(build_chat_messages(&messages)).unwrap();
+
+        assert_eq!(value.as_array().unwrap().len(), 1);
+        assert_eq!(value[0]["role"], "assistant");
+        assert_eq!(value[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(value[0]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(value[0]["tool_calls"][1]["id"], "call-2");
+    }
+
+    #[test]
+    fn maps_recoverable_tool_error_to_json_content() {
+        let messages = vec![AgentMessage::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            name: "add".to_string(),
+            output: "invalid add tool input".to_string(),
+            is_error: true,
+        }];
+
+        let value = serde_json::to_value(build_chat_messages(&messages)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": r#"{"error":"invalid add tool input"}"#
+            }])
         );
     }
 
@@ -523,11 +578,11 @@ mod tests {
 
         assert_eq!(
             decision,
-            ModelDecision::ToolCall {
+            ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
                 name: "add".to_string(),
                 input: r#"{"a":2,"b":3}"#.to_string(),
-            }
+            }])
         );
     }
 
@@ -548,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multiple_tool_calls() {
+    fn parses_multiple_tool_calls_as_one_decision() {
         let response = serde_json::json!({
             "choices": [{
                 "message": {
@@ -576,8 +631,162 @@ mod tests {
         })
         .to_string();
 
-        let error = parse_agent_decision(&response).unwrap_err();
+        let decision = parse_agent_decision(&response).unwrap();
 
-        assert_eq!(error.to_string(), "multiple tool calls are not supported");
+        assert_eq!(
+            decision,
+            ModelDecision::ToolCalls(vec![
+                ToolCall {
+                    id: "call-1".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":1,"b":2}"#.to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_string(),
+                    name: "add".to_string(),
+                    input: r#"{"a":3,"b":4}"#.to_string(),
+                },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn next_decision_returns_final_answer() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer test-key"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "test-model",
+                "temperature": 0.2,
+                "stream": false,
+                "messages": [{
+                    "role": "user",
+                    "content": "hello"
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "done"
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap();
+
+        let messages = vec![AgentMessage::User("hello".to_string())];
+        let decision = model.next_decision(&messages).await.unwrap();
+
+        assert_eq!(decision, ModelDecision::FinalAnswer("done".to_string()));
+    }
+
+    #[tokio::test]
+    async fn next_decision_returns_tool_call() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{\"a\":2,\"b\":3}"
+                            }
+                        }]
+                    }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap();
+
+        let messages = vec![AgentMessage::User("add 2 and 3".to_string())];
+        let decision = model.next_decision(&messages).await.unwrap();
+
+        assert_eq!(
+            decision,
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: r#"{"a":2,"b":3}"#.to_string(),
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn next_decision_rejects_non_success_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap();
+
+        let messages = vec![AgentMessage::User("hello".to_string())];
+        let error = model.next_decision(&messages).await.unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "chat request failed with status 401 Unauthorized"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_decision_rejects_invalid_response_json() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap();
+
+        let messages = vec![AgentMessage::User("hello".to_string())];
+        let error = model.next_decision(&messages).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse agent response"));
     }
 }

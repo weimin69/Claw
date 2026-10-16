@@ -20,6 +20,12 @@ pub enum Commands {
         config_path: String,
         prompt: Option<String>,
     },
+    Claw {
+        config_path: String,
+        prompt: Option<String>,
+        #[arg(long, default_value_t = 8, value_parser = parse_positive_usize)]
+        max_iterations: usize,
+    },
 }
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
