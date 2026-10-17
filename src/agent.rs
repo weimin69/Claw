@@ -55,16 +55,26 @@ pub(crate) trait AgentModel {
 pub(crate) struct AgentState {
     messages: Vec<AgentMessage>,
     iteration: usize,
-    max_iterations: usize,
+    max_iterations: Option<usize>,
+    tool_calls: usize,
+    max_tool_calls: Option<usize>,
 }
 
 impl AgentState {
-    pub(crate) fn new(prompt: String, max_iterations: usize) -> Result<Self> {
+    pub(crate) fn new(
+        prompt: String,
+        max_iterations: Option<usize>,
+        max_tool_calls: Option<usize>,
+    ) -> Result<Self> {
         if prompt.trim().is_empty() {
             bail!("agent prompt cannot be empty");
         }
 
-        if max_iterations == 0 {
+        if max_tool_calls == Some(0) {
+            bail!("max_tool_calls must be greater than 0");
+        }
+
+        if max_iterations == Some(0) {
             bail!("max_iterations must be greater than 0");
         }
 
@@ -72,14 +82,36 @@ impl AgentState {
             messages: vec![AgentMessage::User(prompt)],
             iteration: 0,
             max_iterations,
+            tool_calls: 0,
+            max_tool_calls,
         })
     }
 
+    fn begin_tool_batch(&mut self, count: usize) -> Result<()> {
+        let next = self
+            .tool_calls
+            .checked_add(count)
+            .context("tool call count overflow")?;
+
+        if self.max_tool_calls.is_some_and(|limit| next > limit) {
+            bail!("agent reached maximum tool calls");
+        }
+
+        self.tool_calls = next;
+        Ok(())
+    }
+
     fn begin_iteration(&mut self) -> Result<()> {
-        if self.iteration >= self.max_iterations {
+        if self
+            .max_iterations
+            .is_some_and(|limit| self.iteration >= limit)
+        {
             bail!("agent reached maximum iterations");
         }
-        self.iteration += 1;
+        self.iteration = self
+            .iteration
+            .checked_add(1)
+            .context("iteration count overflow")?;
         Ok(())
     }
 }
@@ -87,10 +119,11 @@ impl AgentState {
 pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
     model: &mut M,
     prompt: String,
-    max_iterations: usize,
+    max_iterations: Option<usize>,
+    max_tool_calls: Option<usize>,
     tool_executor: &mut T,
 ) -> Result<String> {
-    let mut state = AgentState::new(prompt, max_iterations)?;
+    let mut state = AgentState::new(prompt, max_iterations, max_tool_calls)?;
     loop {
         state.begin_iteration()?;
         let decision = model.next_decision(&state.messages).await?;
@@ -100,6 +133,8 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
                 if tool_calls.is_empty() {
                     bail!("model returned an empty tool call list");
                 }
+
+                state.begin_tool_batch(tool_calls.len())?;
 
                 state
                     .messages
@@ -170,32 +205,138 @@ mod tests {
 
     #[test]
     fn creates_initial_agent_state() {
-        let state = AgentState::new("hello".to_string(), 3).unwrap();
+        let state = AgentState::new("hello".to_string(), Some(3), Some(32)).unwrap();
         assert_eq!(
             state.messages,
             vec![AgentMessage::User("hello".to_string())]
         );
         assert_eq!(state.iteration, 0);
-        assert_eq!(state.max_iterations, 3);
+        assert_eq!(state.max_iterations, Some(3));
     }
 
     #[test]
     fn rejects_blank_prompt() {
-        let result = AgentState::new("   \n\t".to_string(), 3);
+        let result = AgentState::new("   \n\t".to_string(), Some(3), Some(32));
         let message = result.unwrap_err().to_string();
         assert_eq!(message, "agent prompt cannot be empty");
     }
 
     #[test]
+    fn rejects_zero_max_tool_calls() {
+        let error = AgentState::new("hello".to_string(), Some(3), Some(0)).unwrap_err();
+        assert_eq!(error.to_string(), "max_tool_calls must be greater than 0");
+    }
+
+    #[tokio::test]
+    async fn runs_without_budgets_past_previous_defaults() {
+        let call = ToolCall {
+            id: "call-1".to_string(),
+            name: "add".to_string(),
+            input: "2,3".to_string(),
+        };
+        let mut decisions = Vec::new();
+        for _ in 0..10 {
+            decisions.push(ModelDecision::ToolCalls(vec![call.clone(); 4]));
+        }
+        decisions.push(ModelDecision::FinalAnswer("done".to_string()));
+        let mut model = FakeModel::new(decisions);
+        let mut tool = FakeToolExecutor {
+            output: ToolOutput::success("5".to_string()),
+            calls: Vec::new(),
+        };
+        let answer = run_agent(&mut model, "hello".to_string(), None, None, &mut tool)
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert_eq!(tool.calls.len(), 40);
+        assert_eq!(model.received_messages.len(), 11);
+    }
+
+    #[test]
+    fn budgets_can_be_configured_independently() {
+        let mut turns_only = AgentState::new("hello".to_string(), Some(1), None).unwrap();
+        turns_only.begin_tool_batch(100).unwrap();
+        turns_only.begin_iteration().unwrap();
+        assert!(turns_only.begin_iteration().is_err());
+
+        let mut tools_only = AgentState::new("hello".to_string(), None, Some(1)).unwrap();
+        for _ in 0..20 {
+            tools_only.begin_iteration().unwrap();
+        }
+        tools_only.begin_tool_batch(1).unwrap();
+        assert!(tools_only.begin_tool_batch(1).is_err());
+    }
+
+    #[test]
+    fn tool_budget_allows_exact_limit_and_preserves_count_on_failure() {
+        let mut state = AgentState::new("hello".to_string(), Some(8), Some(3)).unwrap();
+        state.begin_tool_batch(2).unwrap();
+        state.begin_tool_batch(1).unwrap();
+        assert_eq!(state.tool_calls, 3);
+        let error = state.begin_tool_batch(1).unwrap_err();
+        assert_eq!(error.to_string(), "agent reached maximum tool calls");
+        assert_eq!(state.tool_calls, 3);
+    }
+
+    #[tokio::test]
+    async fn rejects_over_budget_batches_without_partial_execution() {
+        // Exercise both an oversized first batch and a later cumulative overrun.
+        for first_batch in [0, 1] {
+            let call = ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: "2,3".to_string(),
+            };
+            let mut decisions = Vec::new();
+            if first_batch == 1 {
+                decisions.push(ModelDecision::ToolCalls(vec![call.clone()]));
+            }
+            decisions.push(ModelDecision::ToolCalls(vec![call.clone(), call]));
+            let mut model = FakeModel::new(decisions);
+            let mut tool = FakeToolExecutor {
+                output: ToolOutput::success("5".to_string()),
+                calls: Vec::new(),
+            };
+            let error = run_agent(&mut model, "hello".to_string(), Some(8), Some(1), &mut tool)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "agent reached maximum tool calls");
+            assert_eq!(tool.calls.len(), first_batch);
+            assert_eq!(model.received_messages.len(), first_batch + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn allows_final_answer_after_tool_budget_is_exhausted() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "add".to_string(),
+                input: "2,3".to_string(),
+            }]),
+            ModelDecision::FinalAnswer("5".to_string()),
+        ]);
+        let mut tool = FakeToolExecutor {
+            output: ToolOutput::success("5".to_string()),
+            calls: Vec::new(),
+        };
+        let answer = run_agent(&mut model, "hello".to_string(), Some(2), Some(1), &mut tool)
+            .await
+            .unwrap();
+        assert_eq!(answer, "5");
+        assert_eq!(tool.calls.len(), 1);
+    }
+
+    #[test]
     fn rejects_zero_max_iterations() {
-        let result = AgentState::new("hello".to_string(), 0);
+        let result = AgentState::new("hello".to_string(), Some(0), Some(32));
         let message = result.unwrap_err().to_string();
         assert_eq!(message, "max_iterations must be greater than 0");
     }
 
     #[test]
     fn allows_calls_up_to_max_iterations() {
-        let mut state = AgentState::new("hello".to_string(), 3).unwrap();
+        let mut state = AgentState::new("hello".to_string(), Some(3), Some(32)).unwrap();
         for _ in 0..3 {
             state.begin_iteration().unwrap();
         }
@@ -245,9 +386,15 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let answer = run_agent(&mut model, "hello".to_string(), 3, &mut tool)
-            .await
-            .unwrap();
+        let answer = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(3),
+            Some(32),
+            &mut tool,
+        )
+        .await
+        .unwrap();
         assert_eq!(answer, "done");
         assert!(tool.calls.is_empty());
     }
@@ -279,9 +426,15 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let answer = run_agent(&mut model, "hello".to_string(), 2, &mut tool)
-            .await
-            .unwrap();
+        let answer = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(2),
+            Some(32),
+            &mut tool,
+        )
+        .await
+        .unwrap();
         assert_eq!(answer, "5");
         assert_eq!(tool.calls, vec![("add".to_string(), "2,3".to_string())]);
 
@@ -324,12 +477,15 @@ mod tests {
             ]),
             ModelDecision::FinalAnswer("3 and 7".to_string()),
         ]);
-        let mut tool_executor = BuiltinToolExecutor;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
         let answer = run_agent(
             &mut model,
             "give two sums".to_string(),
-            2,
+            Some(2),
+            Some(32),
             &mut tool_executor,
         )
         .await
@@ -385,12 +541,15 @@ mod tests {
             ]),
             ModelDecision::FinalAnswer("one call failed".to_string()),
         ]);
-        let mut tool_executor = BuiltinToolExecutor;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
         let answer = run_agent(
             &mut model,
             "run two calls".to_string(),
-            2,
+            Some(2),
+            Some(32),
             &mut tool_executor,
         )
         .await
@@ -419,11 +578,19 @@ mod tests {
     #[tokio::test]
     async fn rejects_empty_tool_call_list() {
         let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(Vec::new())]);
-        let mut tool_executor = BuiltinToolExecutor;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
-        let error = run_agent(&mut model, "hello".to_string(), 2, &mut tool_executor)
-            .await
-            .unwrap_err();
+        let error = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(2),
+            Some(32),
+            &mut tool_executor,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.to_string(), "model returned an empty tool call list");
     }
@@ -441,7 +608,14 @@ mod tests {
             calls: Vec::new(),
         };
 
-        let result = run_agent(&mut model, "hello".to_string(), 1, &mut tool_executor).await;
+        let result = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(1),
+            Some(32),
+            &mut tool_executor,
+        )
+        .await;
 
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), "agent reached maximum iterations");
@@ -475,7 +649,13 @@ mod tests {
 
         let mut tool_executor = FailingToolExecutor { calls: Vec::new() };
 
-        let result = run_agent(&mut model, "hello".to_string(), 2, &mut tool_executor);
+        let result = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(2),
+            Some(32),
+            &mut tool_executor,
+        );
 
         let error = result.await.unwrap_err();
         assert_eq!(error.to_string(), "tool `add` execution failed");
@@ -509,11 +689,19 @@ mod tests {
             ModelDecision::FinalAnswer("5".to_string()),
         ]);
 
-        let mut tool_executor = BuiltinToolExecutor;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
-        let result = run_agent(&mut model, "add 2 and 3".to_string(), 2, &mut tool_executor)
-            .await
-            .unwrap();
+        let result = run_agent(
+            &mut model,
+            "add 2 and 3".to_string(),
+            Some(2),
+            Some(32),
+            &mut tool_executor,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result, "5");
         assert_eq!(model.received_messages.len(), 2);
@@ -547,12 +735,15 @@ mod tests {
             }]),
             ModelDecision::FinalAnswer("The tool input was invalid".to_string()),
         ]);
-        let mut tool_executor = BuiltinToolExecutor;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
         let answer = run_agent(
             &mut model,
             "add with invalid input".to_string(),
-            2,
+            Some(2),
+            Some(32),
             &mut tool_executor,
         )
         .await

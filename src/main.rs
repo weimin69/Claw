@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod openai_compatible;
 mod tools;
+mod workspace;
 
 use crate::cli::{Cli, Commands};
 use anyhow::Result;
@@ -12,6 +13,10 @@ use clap::Parser;
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
+        if error.is::<commands::claw::Cancelled>() {
+            eprintln!("{error}");
+            std::process::exit(130);
+        }
         eprintln!("error: {}", error);
         let causes: Vec<_> = error.chain().skip(1).collect();
         if !causes.is_empty() {
@@ -45,9 +50,18 @@ async fn run() -> Result<()> {
         Commands::Claw {
             config_path,
             prompt,
+            workspace,
             max_iterations,
+            max_tool_calls,
         } => {
-            commands::claw::execute(&config_path, prompt, max_iterations).await?;
+            commands::claw::execute(
+                &config_path,
+                prompt,
+                &workspace,
+                max_iterations,
+                max_tool_calls,
+            )
+            .await?;
         }
     }
     Ok(())

@@ -4,10 +4,23 @@ use crate::tools::BuiltinToolExecutor;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, stdin};
 
+#[derive(Debug)]
+pub(crate) struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("claw task cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
 pub async fn execute(
     config_path: &str,
     prompt: Option<String>,
-    max_iterations: usize,
+    workspace_path: &std::path::Path,
+    max_iterations: Option<usize>,
+    max_tool_calls: Option<usize>,
 ) -> Result<()> {
     let prompt = match prompt {
         Some(value) => value,
@@ -25,11 +38,19 @@ pub async fn execute(
         bail!("missing llm api key");
     }
 
+    let workspace = crate::workspace::Workspace::new(workspace_path)?;
     let mut model =
         OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?;
-    let mut tool_executor = BuiltinToolExecutor;
+    let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
-    let answer = run_agent(&mut model, prompt, max_iterations, &mut tool_executor).await?;
+    let answer = tokio::select! {
+        biased;
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("failed to listen for Ctrl+C")?;
+            return Err(Cancelled.into());
+        }
+        answer = run_agent(&mut model, prompt, max_iterations, max_tool_calls, &mut tool_executor) => answer?,
+    };
 
     println!("{answer}");
     Ok(())

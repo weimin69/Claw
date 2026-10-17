@@ -68,10 +68,10 @@ impl Config {
             return;
         }
 
-        if let Some(api_key) = env_api_key {
-            if !api_key.trim().is_empty() {
-                self.llm.api_key = api_key;
-            }
+        if let Some(api_key) = env_api_key
+            && !api_key.trim().is_empty()
+        {
+            self.llm.api_key = api_key;
         }
     }
 

@@ -202,6 +202,59 @@ fn build_add_tool() -> ChatTool {
     }
 }
 
+fn build_list_files_tool() -> ChatTool {
+    ChatTool {
+        kind: "function".to_string(),
+        function: ChatFunctionDefinition {
+            name: "list_files".to_string(),
+            description: "List direct children of a workspace directory, sorted by path. Returns at most 200 entries and a truncated flag. Paths are workspace-relative; use '.' for the root. Symlinks are listed without following them.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "minLength": 1}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+    }
+}
+
+fn build_read_file_tool() -> ChatTool {
+    ChatTool {
+        kind: "function".to_string(),
+        function: ChatFunctionDefinition {
+            name: "read_file".to_string(),
+            description: "Read a workspace UTF-8 regular file up to 1 MiB. Lines are 1-based and inclusive; defaults to 200 lines from start_line (default 1). Returns at most 500 lines and 32 KiB of content. truncated means content remains after the returned text, including when end_line was requested; the last line may be partial at the byte limit. Empty files return end_line 0.".to_string(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "path":{"type":"string","minLength":1},
+                    "start_line":{"type":"integer","minimum":1},
+                    "end_line":{"type":"integer","minimum":1}
+                },
+                "required":["path"], "additionalProperties":false
+            }),
+        },
+    }
+}
+
+fn build_search_code_tool() -> ChatTool {
+    ChatTool {
+        kind: "function".to_string(),
+        function: ChatFunctionDefinition {
+            name: "search_code".to_string(),
+            description: "Search a workspace file or directory recursively for a case-sensitive literal single-line pattern (1-1024 bytes). Skip discovered symlinks, .git and target directories, binary/non-UTF-8 files, and files over 1 MiB. Scan at most 5000 directory entries and 8 MiB. Return up to 100 matching lines sorted by path and line, within 32 KiB JSON. Each text excerpt is at most 1024 bytes and may start at the match; line_truncated marks shortened lines. truncated marks incomplete scanning/results; skipped_files counts unsupported files. No matches is a successful result. Does not apply .gitignore rules.".to_string(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "pattern":{"type":"string","minLength":1,"maxLength":1024},
+                    "path":{"type":"string","minLength":1}
+                },
+                "required":["pattern","path"], "additionalProperties":false
+            }),
+        },
+    }
+}
+
 fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
@@ -252,7 +305,12 @@ fn build_agent_chat_request(
         temperature,
         messages: build_chat_messages(messages),
         stream: false,
-        tools: vec![build_add_tool()],
+        tools: vec![
+            build_add_tool(),
+            build_list_files_tool(),
+            build_read_file_tool(),
+            build_search_code_tool(),
+        ],
     }
 }
 
