@@ -51,6 +51,7 @@ async fn run() -> Result<()> {
             config_path,
             prompt,
             workspace,
+            allow_write,
             max_iterations,
             max_tool_calls,
         } => {
@@ -58,6 +59,7 @@ async fn run() -> Result<()> {
                 &config_path,
                 prompt,
                 &workspace,
+                allow_write,
                 max_iterations,
                 max_tool_calls,
             )

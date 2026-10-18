@@ -13,6 +13,88 @@ fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {
     file
 }
 
+#[tokio::test]
+async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
+    for allow_write in [false, true] {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, "old\n").unwrap();
+        let config = write_temp_config(&format!(
+            "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+            server.uri()
+        ));
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let edit_tool = body["tools"].as_array().unwrap().iter()
+                    .any(|tool| tool["function"]["name"] == "replace_text");
+                body["messages"].as_array().unwrap().len() == 1 && edit_tool == allow_write
+            })
+            // Also send a forged call when the schema is hidden: executor
+            // authorization must stand independently of model behavior.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":null,"tool_calls":[{
+                    "id":"edit-1","type":"function","function":{
+                        "name":"replace_text","arguments":"{\"path\":\"file\",\"old_text\":\"old\",\"new_text\":\"new\"}"
+                    }
+                }]}}]
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let message = &body["messages"][2];
+                if message["role"] != "tool" || message["tool_call_id"] != "edit-1" {
+                    return false;
+                }
+                let Some(result) = message["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                else {
+                    return false;
+                };
+                if allow_write {
+                    result["applied"] == true
+                        && result["path"] == "file"
+                        && result["diff"]
+                            .as_str()
+                            .is_some_and(|diff| diff.contains("-old\n+new\n"))
+                } else {
+                    result["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("write access denied"))
+                }
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":"finished"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut command = Command::cargo_bin("agent-cli-rust").unwrap();
+        command
+            .arg("claw")
+            .arg(config.path())
+            .arg("edit file")
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--max-iterations", "2"]);
+        if allow_write {
+            command.arg("--allow-write");
+        }
+        command
+            .timeout(std::time::Duration::from_secs(5))
+            .assert()
+            .success()
+            .stdout(contains("finished"))
+            .stderr(is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            if allow_write { "new\n" } else { "old\n" }
+        );
+    }
+}
+
 fn list_files_tool_definition() -> serde_json::Value {
     serde_json::json!({
         "type": "function",

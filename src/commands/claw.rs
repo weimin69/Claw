@@ -19,6 +19,7 @@ pub async fn execute(
     config_path: &str,
     prompt: Option<String>,
     workspace_path: &std::path::Path,
+    allow_write: bool,
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
 ) -> Result<()> {
@@ -40,8 +41,9 @@ pub async fn execute(
 
     let workspace = crate::workspace::Workspace::new(workspace_path)?;
     let mut model =
-        OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?;
-    let mut tool_executor = BuiltinToolExecutor::new(workspace);
+        OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?
+            .with_write_access(allow_write);
+    let mut tool_executor = BuiltinToolExecutor::new(workspace).with_write_access(allow_write);
 
     let answer = tokio::select! {
         biased;

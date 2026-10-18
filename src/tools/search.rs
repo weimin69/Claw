@@ -45,13 +45,12 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
         bail!("search_code path must not be empty");
     }
     let root = workspace.resolve_existing(Path::new(&input.path))?;
-    let mut pending = vec![root];
-    let mut files = Vec::new();
-    let mut visited = 0;
+    let mut pending = vec![root]; //未遍历 DFS 避免使用递归
+    let mut files = Vec::new(); //找到的普通文件
+    let mut visited = 0; //统计以及检查的目录
     let mut output = SearchOutput::default();
 
-    // Bound traversal as well as file reads. Never follow symlinks discovered
-    // during traversal; resolve each target again before accessing it.
+
     'walk: while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path).context("failed to inspect search path")?;
         if metadata.file_type().is_symlink() {
@@ -74,7 +73,7 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
                 if kind.is_symlink() {
                     continue;
                 }
-                if kind.is_dir() && (entry.file_name() == ".git" || entry.file_name() == "target") {
+                if kind.is_dir() && (entry.file_name() == ".git" || entry.file_name() == "target" ) {
                     continue;
                 }
                 if kind.is_file() {

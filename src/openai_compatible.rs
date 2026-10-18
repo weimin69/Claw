@@ -86,6 +86,7 @@ pub(crate) struct OpenAiCompatibleAgentModel {
     api_key: String,
     model: String,
     temperature: f64,
+    allow_write: bool,
 }
 
 impl OpenAiCompatibleAgentModel {
@@ -106,13 +107,22 @@ impl OpenAiCompatibleAgentModel {
             api_key,
             model,
             temperature,
+            allow_write: false,
         })
+    }
+
+    pub(crate) fn with_write_access(mut self, allow_write: bool) -> Self {
+        self.allow_write = allow_write;
+        self
     }
 }
 
 impl AgentModel for OpenAiCompatibleAgentModel {
     async fn next_decision(&mut self, messages: &[AgentMessage]) -> Result<ModelDecision> {
-        let request = build_agent_chat_request(self.model.clone(), self.temperature, messages);
+        let mut request = build_agent_chat_request(self.model.clone(), self.temperature, messages);
+        if self.allow_write {
+            request.tools.push(build_replace_text_tool());
+        }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let response = self
@@ -250,6 +260,23 @@ fn build_search_code_tool() -> ChatTool {
                     "path":{"type":"string","minLength":1}
                 },
                 "required":["pattern","path"], "additionalProperties":false
+            }),
+        },
+    }
+}
+
+fn build_replace_text_tool() -> ChatTool {
+    ChatTool {
+        kind: "function".to_string(),
+        function: ChatFunctionDefinition {
+            name:"replace_text".to_string(),
+            description:"Replace one unique exact occurrence in an existing workspace UTF-8 regular file (maximum 1 MiB before and after). old_text must be nonempty and uniquely identify the edit, including overlapping occurrences. Preserve other content. Use read_file first. Returns applied, changed and a diff; diff_truncated marks an incomplete diff. Does not create or delete files. Conflicting content, read-only files and invalid paths return errors without writing. This tool is available only with explicit write access.".to_string(),
+            parameters:serde_json::json!({
+                "type":"object", "properties":{
+                    "path":{"type":"string","minLength":1},
+                    "old_text":{"type":"string","minLength":1},
+                    "new_text":{"type":"string"}
+                },"required":["path","old_text","new_text"],"additionalProperties":false
             }),
         },
     }

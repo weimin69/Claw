@@ -26,6 +26,9 @@ pub enum Commands {
         /// Project directory available to repository tools.
         #[arg(long, default_value = ".")]
         workspace: std::path::PathBuf,
+        /// Allow the agent to replace text in existing workspace files.
+        #[arg(long)]
+        allow_write: bool,
         /// Maximum model turns; omitted means no turn budget.
         #[arg(long, value_parser = parse_positive_usize)]
         max_iterations: Option<usize>,

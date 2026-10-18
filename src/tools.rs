@@ -4,15 +4,24 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read, path::Path};
 
+mod edit;
 mod search;
-
 pub(crate) struct BuiltinToolExecutor {
     workspace: Workspace,
+    allow_write: bool,
 }
 
 impl BuiltinToolExecutor {
     pub(crate) fn new(workspace: Workspace) -> Self {
-        Self { workspace }
+        Self {
+            workspace,
+            allow_write: false,
+        }
+    }
+
+    pub(crate) fn with_write_access(mut self, allow_write: bool) -> Self {
+        self.allow_write = allow_write;
+        self
     }
 }
 
@@ -20,6 +29,18 @@ impl ToolExecutor for BuiltinToolExecutor {
     async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
         let result = match name {
             "add" => execute_add(input),
+            "replace_text" => {
+                if !self.allow_write {
+                    return Ok(ToolOutput::error(
+                        "write access denied; enable --allow-write to use replace_text".to_string(),
+                    ));
+                }
+                let workspace = self.workspace.clone();
+                let input = input.to_string();
+                tokio::task::spawn_blocking(move || edit::execute(&workspace, &input))
+                    .await
+                    .context("replace_text worker failed")?
+            }
             "list_files" => {
                 let workspace = self.workspace.clone();
                 let input = input.to_string();
@@ -231,6 +252,41 @@ fn execute_add(input: &str) -> Result<String> {
 mod tests {
 
     use super::*;
+
+    #[tokio::test]
+    async fn replace_text_checks_permissions_before_parsing_or_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        std::fs::write(&path, "old").unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let mut executor = BuiltinToolExecutor::new(workspace);
+        let denied = executor.execute("replace_text", "not json").await.unwrap();
+        assert!(denied.is_error);
+        assert!(denied.content.contains("write access denied"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        let mut executor = executor.with_write_access(true);
+        let output = executor
+            .execute(
+                "replace_text",
+                r#"{"path":"file","old_text":"old","new_text":"new"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        let value: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(value["applied"], true);
+        assert!(value["diff"].as_str().unwrap().contains("+new"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let output = executor
+            .execute(
+                "replace_text",
+                r#"{"path":"file","old_text":"absent","new_text":"x"}"#,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+    }
 
     #[test]
     fn read_file_preserves_text_and_selects_inclusive_lines() {
