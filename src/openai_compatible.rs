@@ -23,6 +23,7 @@ enum ChatMessage {
     #[serde(rename = "assistant")]
     Assistant {
         content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ChatToolCall>,
     },
 
@@ -333,6 +334,10 @@ fn build_chat_messages(messages: &[AgentMessage]) -> Vec<ChatMessage> {
         .map(|message| match message {
             AgentMessage::User(content) => ChatMessage::User {
                 content: content.clone(),
+            },
+            AgentMessage::Assistant(content) => ChatMessage::Assistant {
+                content: Some(content.clone()),
+                tool_calls: Vec::new(),
             },
 
             AgentMessage::AssistantToolCalls(tool_calls) => ChatMessage::Assistant {

@@ -1,4 +1,12 @@
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AgentRunResult {
+    pub(crate) answer: String,
+    pub(crate) iterations: usize,
+    pub(crate) tool_calls: BTreeMap<String, usize>,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ModelDecision {
@@ -16,6 +24,7 @@ pub(crate) struct ToolCall {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) enum AgentMessage {
     User(String),
+    Assistant(String),
     AssistantToolCalls(Vec<ToolCall>),
     ToolResult {
         tool_call_id: String,
@@ -116,19 +125,68 @@ impl AgentState {
     }
 }
 
+/// In-memory history. An interrupted/failed turn closes the session rather than
+/// reusing potentially incomplete assistant/tool message pairs.
+#[derive(Default)]
+pub(crate) struct AgentSession {
+    messages: Option<Vec<AgentMessage>>,
+    closed: bool,
+}
+
+impl AgentSession {
+    pub(crate) async fn run_turn<M: AgentModel, T: ToolExecutor>(
+        &mut self,
+        model: &mut M,
+        prompt: String,
+        max_iterations: Option<usize>,
+        max_tool_calls: Option<usize>,
+        tool_executor: &mut T,
+    ) -> Result<AgentRunResult> {
+        if self.closed {
+            bail!("agent session is closed after an interrupted or failed turn");
+        }
+        let mut state = AgentState::new(prompt, max_iterations, max_tool_calls)?;
+        let mut messages = self.messages.take().unwrap_or_default();
+        messages.append(&mut state.messages);
+        state.messages = messages;
+        self.closed = true;
+        let result = run_turn_loop(model, &mut state, tool_executor).await?;
+        self.messages = Some(state.messages);
+        self.closed = false;
+        Ok(result)
+    }
+}
+
 pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
     model: &mut M,
     prompt: String,
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
     tool_executor: &mut T,
-) -> Result<String> {
-    let mut state = AgentState::new(prompt, max_iterations, max_tool_calls)?;
+) -> Result<AgentRunResult> {
+    AgentSession::default()
+        .run_turn(model, prompt, max_iterations, max_tool_calls, tool_executor)
+        .await
+}
+
+async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
+    model: &mut M,
+    state: &mut AgentState,
+    tool_executor: &mut T,
+) -> Result<AgentRunResult> {
+    let mut tool_counts = BTreeMap::<String, usize>::new();
     loop {
         state.begin_iteration()?;
         let decision = model.next_decision(&state.messages).await?;
         match decision {
-            ModelDecision::FinalAnswer(answer) => return Ok(answer),
+            ModelDecision::FinalAnswer(answer) => {
+                state.messages.push(AgentMessage::Assistant(answer.clone()));
+                return Ok(AgentRunResult {
+                    answer,
+                    iterations: state.iteration,
+                    tool_calls: tool_counts,
+                });
+            }
             ModelDecision::ToolCalls(tool_calls) => {
                 if tool_calls.is_empty() {
                     bail!("model returned an empty tool call list");
@@ -141,6 +199,8 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
                     .push(AgentMessage::AssistantToolCalls(tool_calls.clone()));
 
                 for tool_call in tool_calls {
+                    let count = tool_counts.entry(tool_call.name.clone()).or_default();
+                    *count = count.checked_add(1).context("tool usage count overflow")?;
                     let tool_output = tool_executor
                         .execute(&tool_call.name, &tool_call.input)
                         .await
@@ -247,7 +307,7 @@ mod tests {
         let answer = run_agent(&mut model, "hello".to_string(), None, None, &mut tool)
             .await
             .unwrap();
-        assert_eq!(answer, "done");
+        assert_eq!(answer.answer, "done");
         assert_eq!(tool.calls.len(), 40);
         assert_eq!(model.received_messages.len(), 11);
     }
@@ -323,7 +383,7 @@ mod tests {
         let answer = run_agent(&mut model, "hello".to_string(), Some(2), Some(1), &mut tool)
             .await
             .unwrap();
-        assert_eq!(answer, "5");
+        assert_eq!(answer.answer, "5");
         assert_eq!(tool.calls.len(), 1);
     }
 
@@ -395,8 +455,109 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(answer, "done");
+        assert_eq!(answer.answer, "done");
+        assert_eq!(answer.iterations, 1);
+        assert!(answer.tool_calls.is_empty());
         assert!(tool.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_preserves_answers_and_tools_but_resets_turn_budgets() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call-1".into(),
+                name: "add".into(),
+                input: "2,3".into(),
+            }]),
+            ModelDecision::FinalAnswer("1. clear the file".into()),
+            ModelDecision::FinalAnswer("confirmed".into()),
+        ]);
+        let mut tool = FakeToolExecutor {
+            output: ToolOutput::success("5".into()),
+            calls: Vec::new(),
+        };
+        let mut session = AgentSession::default();
+        let first = session
+            .run_turn(&mut model, "options?".into(), Some(2), Some(1), &mut tool)
+            .await
+            .unwrap();
+        let second = session
+            .run_turn(&mut model, "1".into(), Some(1), Some(1), &mut tool)
+            .await
+            .unwrap();
+        assert_eq!(first.iterations, 2);
+        assert_eq!(first.tool_calls["add"], 1);
+        assert_eq!(second.iterations, 1);
+        assert!(second.tool_calls.is_empty());
+        assert_eq!(
+            model.received_messages[2],
+            vec![
+                AgentMessage::User("options?".into()),
+                AgentMessage::AssistantToolCalls(vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "add".into(),
+                    input: "2,3".into(),
+                }]),
+                AgentMessage::ToolResult {
+                    tool_call_id: "call-1".into(),
+                    name: "add".into(),
+                    output: "5".into(),
+                    is_error: false,
+                },
+                AgentMessage::Assistant("1. clear the file".into()),
+                AgentMessage::User("1".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rejects_reuse_after_failed_turn() {
+        let mut session = AgentSession::default();
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![])]);
+        let mut tool = FakeToolExecutor {
+            output: ToolOutput::success("unused".into()),
+            calls: Vec::new(),
+        };
+        assert!(
+            session
+                .run_turn(&mut model, "hello".into(), None, None, &mut tool)
+                .await
+                .is_err()
+        );
+        let error = session
+            .run_turn(&mut model, "retry".into(), None, None, &mut tool)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("session is closed"));
+        assert_eq!(model.received_messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_tools_across_rounds_including_recoverable_failures() {
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: r#"{"a":2,"b":3}"#.to_string(),
+        };
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![call("1", "add"), call("2", "unknown")]),
+            ModelDecision::ToolCalls(vec![call("3", "add")]),
+            ModelDecision::FinalAnswer("done".to_string()),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
+        let mut tools = BuiltinToolExecutor::new(workspace);
+
+        let result = run_agent(&mut model, "hello".to_string(), None, None, &mut tools)
+            .await
+            .unwrap();
+
+        assert_eq!(result.answer, "done");
+        assert_eq!(result.iterations, 3);
+        assert_eq!(
+            result.tool_calls,
+            BTreeMap::from([("add".to_string(), 2), ("unknown".to_string(), 1),])
+        );
     }
 
     #[tokio::test]
@@ -435,7 +596,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(answer, "5");
+        assert_eq!(answer.answer, "5");
         assert_eq!(tool.calls, vec![("add".to_string(), "2,3".to_string())]);
 
         assert_eq!(
@@ -491,7 +652,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer, "3 and 7");
+        assert_eq!(answer.answer, "3 and 7");
+        assert_eq!(answer.iterations, 2);
+        assert_eq!(answer.tool_calls, BTreeMap::from([("add".to_string(), 2)]));
         assert_eq!(
             model.received_messages[1],
             vec![
@@ -555,7 +718,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer, "one call failed");
+        assert_eq!(answer.answer, "one call failed");
         assert_eq!(
             &model.received_messages[1][2..],
             [
@@ -703,7 +866,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result, "5");
+        assert_eq!(result.answer, "5");
         assert_eq!(model.received_messages.len(), 2);
 
         assert_eq!(
@@ -749,7 +912,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer, "The tool input was invalid");
+        assert_eq!(answer.answer, "The tool input was invalid");
         assert_eq!(
             model.received_messages[1].last(),
             Some(&AgentMessage::ToolResult {

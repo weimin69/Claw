@@ -55,15 +55,19 @@ async fn run() -> Result<()> {
             allow_exec,
             max_iterations,
             max_tool_calls,
+            interactive,
         } => {
             commands::claw::execute(
                 &config_path,
                 prompt,
-                &workspace,
-                allow_write,
-                allow_exec,
-                max_iterations,
-                max_tool_calls,
+                commands::claw::ClawOptions {
+                    workspace_path: &workspace,
+                    allow_write,
+                    allow_exec,
+                    max_iterations,
+                    max_tool_calls,
+                    interactive,
+                },
             )
             .await?;
         }

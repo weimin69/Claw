@@ -23,6 +23,9 @@ pub enum Commands {
     Claw {
         config_path: String,
         prompt: Option<String>,
+        /// Keep an in-memory conversation until /exit, EOF or Ctrl+C.
+        #[arg(long)]
+        interactive: bool,
         /// Project directory available to repository tools.
         #[arg(long, default_value = ".")]
         workspace: std::path::PathBuf,

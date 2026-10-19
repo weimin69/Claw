@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, is_empty};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -11,6 +12,136 @@ fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {
     let mut file = tempfile::NamedTempFile::new().unwrap();
     file.write_all(contents.as_bytes()).unwrap();
     file
+}
+
+#[tokio::test]
+async fn interactive_claw_preserves_conversation_and_exits_on_command_or_eof() {
+    for (ending, initial_prompt) in [("/exit\nignored\n", false), ("", false), ("/exit\n", true)] {
+        let server = MockServer::start().await;
+        let config = write_temp_config(&format!(
+            "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+            server.uri()
+        ));
+        let first = if initial_prompt {
+            "options?"
+        } else {
+            "options?\n"
+        };
+        for (messages, answer) in [
+            (
+                serde_json::json!([{"role":"user","content":first}]),
+                "1. clear the file",
+            ),
+            (
+                serde_json::json!([
+                    {"role":"user","content":first},
+                    {"role":"assistant","content":"1. clear the file"},
+                    {"role":"user","content":"1\n"}
+                ]),
+                "confirmed",
+            ),
+        ] {
+            Mock::given(method("POST"))
+                .and(move |request: &wiremock::Request| {
+                    let body: serde_json::Value = request.body_json().unwrap();
+                    body["messages"] == messages
+                })
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices":[{"message":{"content":answer}}]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let mut command = Command::cargo_bin("agent-cli-rust").unwrap();
+        command.arg("claw").arg(config.path());
+        if initial_prompt {
+            command.arg(first);
+        }
+        let input = if initial_prompt {
+            format!("1\n{ending}")
+        } else {
+            format!("\noptions?\n1\n{ending}")
+        };
+        command
+            .arg("--interactive")
+            .args(["--max-iterations", "1"])
+            .write_stdin(input)
+            .timeout(std::time::Duration::from_secs(10))
+            .assert()
+            .success()
+            .stdout(contains("1. clear the file").and(contains("confirmed")))
+            .stderr(contains("交互模式"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interactive_claw_cancels_while_waiting_for_user_input() {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let config = write_temp_config(
+        "[llm]\nbase_url = \"http://127.0.0.1:1\"\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+    );
+    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("agent-cli-rust"))
+        .arg("claw")
+        .arg(config.path())
+        .arg("--interactive")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut output = Vec::new();
+        loop {
+            output.push(stderr.read_u8().await.unwrap());
+            if output.ends_with("你> ".as_bytes()) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("interactive prompt was not displayed");
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-INT", &child.id().unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+        .await
+        .expect("interactive CLI hung on stdin after Ctrl+C")
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+}
+
+#[tokio::test]
+async fn interactive_claw_stops_on_model_failure_without_processing_next_input() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let config = write_temp_config(&format!(
+        "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+        server.uri()
+    ));
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("--interactive")
+        .write_stdin("hello\nnext message\n")
+        .timeout(std::time::Duration::from_secs(5))
+        .assert()
+        .failure()
+        .stdout(is_empty())
+        .stderr(contains("error:"));
 }
 
 #[cfg(unix)]
@@ -799,7 +930,7 @@ temperature = 0.2
         .arg(config_file.path().parent().unwrap())
         .assert()
         .success()
-        .stdout(contains("Hello from Claw"))
+        .stdout("Hello from Claw\n\n执行统计：\n工具调用：\n  无\n工具调用总数：0\nLoop 次数：1\n")
         .stderr(is_empty());
 }
 
@@ -920,6 +1051,6 @@ temperature = 0.2
         .arg("add 2 and 3")
         .assert()
         .success()
-        .stdout(contains("The result is 5"))
+        .stdout("The result is 5\n\n执行统计：\n工具调用：\n  add: 1 次\n工具调用总数：1\nLoop 次数：2\n")
         .stderr(is_empty());
 }
