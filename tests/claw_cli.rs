@@ -13,6 +13,91 @@ fn write_temp_config(contents: &str) -> tempfile::NamedTempFile {
     file
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn claw_only_exposes_and_executes_commands_with_exec_authorization() {
+    for allow_exec in [false, true] {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = write_temp_config(&format!(
+            "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+            server.uri()
+        ));
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let tools = body["tools"].as_array().unwrap();
+                let exposed = tools.iter().any(|tool|tool["function"]["name"] == "run_command");
+                let writable = tools.iter().any(|tool|tool["function"]["name"] == "replace_text");
+                body["messages"].as_array().unwrap().len() == 1 && exposed == allow_exec && !writable
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":null,"tool_calls":[{
+                    "id":"exec-1","type":"function","function":{
+                        "name":"run_command","arguments":"{\"program\":\"/bin/sh\",\"args\":[\"-c\",\"printf executed > marker; printf output; printf problem >&2; exit 3\"]}"
+                    }
+                }]}}]
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let message = &body["messages"][2];
+                if message["tool_call_id"] != "exec-1" {
+                    return false;
+                }
+                let Some(result) = message["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                else {
+                    return false;
+                };
+                let Some(error) = result["error"].as_str() else {
+                    return false;
+                };
+                if allow_exec {
+                    serde_json::from_str::<serde_json::Value>(error)
+                        .ok()
+                        .is_some_and(|result| {
+                            result["exit_code"] == 3
+                                && result["stdout"] == "output"
+                                && result["stderr"] == "problem"
+                                && result["timed_out"] == false
+                        })
+                } else {
+                    error.contains("execution access denied")
+                }
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":"command result received"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut command = Command::cargo_bin("agent-cli-rust").unwrap();
+        command
+            .arg("claw")
+            .arg(config.path())
+            .arg("run command")
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--max-iterations", "2"]);
+        if allow_exec {
+            command.arg("--allow-exec");
+        }
+        command
+            .timeout(std::time::Duration::from_secs(5))
+            .assert()
+            .success()
+            .stdout(contains("command result received"))
+            .stderr(is_empty());
+        let marker = directory.path().join("marker");
+        assert_eq!(marker.exists(), allow_exec);
+        if allow_exec {
+            assert_eq!(std::fs::read_to_string(marker).unwrap(), "executed");
+        }
+    }
+}
+
 #[tokio::test]
 async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
     for allow_write in [false, true] {
@@ -95,6 +180,87 @@ async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
     }
 }
 
+#[tokio::test]
+async fn claw_only_creates_files_with_write_authorization() {
+    for allow_write in [false, true] {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file");
+        assert!(!path.exists());
+        let config = write_temp_config(&format!(
+            "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+            server.uri()
+        ));
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let edit_tool = body["tools"].as_array().unwrap().iter()
+                    .any(|tool| tool["function"]["name"] == "create_file");
+                body["messages"].as_array().unwrap().len() == 1 && edit_tool == allow_write
+            })
+            // Also send a forged call when the schema is hidden: executor
+            // authorization must stand independently of model behavior.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":null,"tool_calls":[{
+                    "id":"create-1","type":"function","function":{
+                        "name":"create_file","arguments":"{\"path\":\"file\",\"content\":\"new\\n\"}"
+                    }
+                }]}}]
+            }))).expect(1).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(move |request: &wiremock::Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                let message = &body["messages"][2];
+                if message["role"] != "tool" || message["tool_call_id"] != "create-1" {
+                    return false;
+                }
+                let Some(result) = message["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                else {
+                    return false;
+                };
+                if allow_write {
+                    result["created"] == true
+                        && result["path"] == "file"
+                        && result["bytes_written"] == 4
+                } else {
+                    result["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("write access denied"))
+                }
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices":[{"message":{"content":"finished"}}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut command = Command::cargo_bin("agent-cli-rust").unwrap();
+        command
+            .arg("claw")
+            .arg(config.path())
+            .arg("create file")
+            .arg("--workspace")
+            .arg(directory.path())
+            .args(["--max-iterations", "2"]);
+        if allow_write {
+            command.arg("--allow-write");
+        }
+        command
+            .timeout(std::time::Duration::from_secs(5))
+            .assert()
+            .success()
+            .stdout(contains("finished"))
+            .stderr(is_empty());
+        if allow_write {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        } else {
+            assert!(!path.exists());
+        }
+    }
+}
+
 fn list_files_tool_definition() -> serde_json::Value {
     serde_json::json!({
         "type": "function",
@@ -107,6 +273,84 @@ fn list_files_tool_definition() -> serde_json::Value {
             }
         }
     })
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn claw_sigint_stops_running_command_and_descendants() {
+    use std::{process::Stdio, time::Duration};
+    use tokio::io::AsyncReadExt;
+
+    let server = MockServer::start().await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = write_temp_config(&format!(
+        "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+        server.uri()
+    ));
+    let arguments = serde_json::json!({
+        "program":"/bin/sh",
+        "args":["-c","(sleep 2; printf orphan > late) & printf ready > ready; wait"]
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices":[{"message":{"content":null,"tool_calls":[{
+                "id":"wait-1","type":"function","function":{"name":"run_command","arguments":arguments}
+            }]}}]
+        }))).expect(1).mount(&server).await;
+    let mut child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin("agent-cli-rust"))
+        .arg("claw")
+        .arg(config.path())
+        .arg("wait for command")
+        .arg("--workspace")
+        .arg(directory.path())
+        .arg("--allow-exec")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !directory.path().join("ready").exists() {
+            assert!(child.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("command did not become ready");
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-INT", &child.id().unwrap().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .await
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .await
+        .unwrap();
+    assert!(stdout.is_empty());
+    assert_eq!(stderr.trim(), "claw task cancelled");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(!directory.path().join("late").exists());
 }
 
 fn search_code_tool_definition() -> serde_json::Value {

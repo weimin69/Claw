@@ -38,6 +38,33 @@ impl Workspace {
 
         Ok(resolved)
     }
+
+    /// Resolve an existing parent without following the new target itself.
+    /// Final publication must still use a no-clobber operation to avoid races.
+    pub(crate) fn resolve_new_file(&self, path: &Path) -> Result<PathBuf> {
+        let raw = path.as_os_str().to_string_lossy();
+        let last = raw.rsplit(std::path::MAIN_SEPARATOR).next().unwrap_or("");
+        if matches!(last, "" | "." | "..") {
+            bail!("create_file requires a file name");
+        }
+        let candidate = self.root.join(path);
+        let parent = candidate
+            .parent()
+            .context("create_file path has no parent")?;
+        let parent = self.resolve_existing(parent)?;
+        if !parent.is_dir() {
+            bail!("create_file parent must be a directory");
+        }
+        let name = candidate
+            .file_name()
+            .context("create_file requires a file name")?;
+        let target = parent.join(name);
+        match std::fs::symlink_metadata(&target) {
+            Ok(_) => bail!("create_file target already exists"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(target),
+            Err(error) => Err(error).context("failed to inspect create_file target"),
+        }
+    }
 }
 
 #[cfg(test)]

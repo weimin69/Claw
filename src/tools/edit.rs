@@ -62,9 +62,6 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
 
 /// Prepare a proposal only; never writes to disk or sends content to the model.
 fn prepare_edit(workspace: &Workspace, input: ReplaceTextInput) -> Result<EditPlan> {
-    if input.old_text.is_empty() {
-        bail!("old_text must not be empty");
-    }
     if input.path.trim().is_empty() {
         bail!("path must not be empty");
     }
@@ -91,19 +88,24 @@ fn prepare_edit(workspace: &Workspace, input: ReplaceTextInput) -> Result<EditPl
         bail!("replace_text does not support NUL bytes");
     }
     let content = std::str::from_utf8(&bytes).context("replace_text requires UTF-8 text")?;
-    let position = content
-        .find(&input.old_text)
-        .context("old_text was not found in file")?;
-    // Check overlapping matches too: "aa" in "aaa" is ambiguous.
-    let next = position
-        + input
-            .old_text
-            .chars()
-            .next()
-            .context("old_text must not be empty")?
-            .len_utf8();
-    if content[next..].contains(&input.old_text) {
-        bail!("old_text matches multiple locations; provide more surrounding context");
+    if input.old_text.is_empty() && !content.is_empty() {
+        bail!("old_text must not be empty for a nonempty file");
+    }
+    if !input.old_text.is_empty() {
+        let position = content
+            .find(&input.old_text)
+            .context("old_text was not found in file")?;
+        // Check overlapping matches too: "aa" in "aaa" is ambiguous.
+        let next = position
+            + input
+                .old_text
+                .chars()
+                .next()
+                .context("old_text must not be empty")?
+                .len_utf8();
+        if content[next..].contains(&input.old_text) {
+            bail!("old_text matches multiple locations; provide more surrounding context");
+        }
     }
     let retained = content.len() - input.old_text.len();
     if input.new_text.len() > MAX_READ_FILE_BYTES - retained {
@@ -270,6 +272,48 @@ mod tests {
             path: "file".to_string(),
             old_text: old.to_string(),
             new_text: new.to_string(),
+        }
+    }
+
+    #[test]
+    fn initializes_existing_empty_file_and_preserves_conflict_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        fs::write(&path, "").unwrap();
+        let plan = prepare_edit(&workspace, input("", "你好\n")).unwrap();
+        assert_eq!(plan.original, "");
+        assert_eq!(plan.updated, "你好\n");
+        assert!(plan.diff.contains("@@ -0,0 +1,1 @@"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        apply_edit(&workspace, &plan).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "你好\n");
+
+        fs::write(&path, "").unwrap();
+        let plan = prepare_edit(&workspace, input("", "agent content")).unwrap();
+        fs::write(&path, "user content").unwrap();
+        assert!(apply_edit(&workspace, &plan).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "user content");
+    }
+
+    #[test]
+    fn empty_initialization_obeys_content_limits_and_nonempty_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        fs::write(&path, "").unwrap();
+        let plan = prepare_edit(&workspace, input("", "")).unwrap();
+        assert!(plan.updated.is_empty());
+        assert!(plan.diff.is_empty());
+        assert!(prepare_edit(&workspace, input("missing", "text")).is_err());
+        assert!(prepare_edit(&workspace, input("", "\0")).is_err());
+        assert!(prepare_edit(&workspace, input("", &"x".repeat(MAX_READ_FILE_BYTES + 1))).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        for content in ["text", " \n"] {
+            fs::write(&path, content).unwrap();
+            let error = prepare_edit(&workspace, input("", "overwrite")).unwrap_err();
+            assert!(error.to_string().contains("nonempty file"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
         }
     }
 

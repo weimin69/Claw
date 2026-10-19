@@ -87,6 +87,7 @@ pub(crate) struct OpenAiCompatibleAgentModel {
     model: String,
     temperature: f64,
     allow_write: bool,
+    allow_exec: bool,
 }
 
 impl OpenAiCompatibleAgentModel {
@@ -108,11 +109,17 @@ impl OpenAiCompatibleAgentModel {
             model,
             temperature,
             allow_write: false,
+            allow_exec: false,
         })
     }
 
     pub(crate) fn with_write_access(mut self, allow_write: bool) -> Self {
         self.allow_write = allow_write;
+        self
+    }
+
+    pub(crate) fn with_exec_access(mut self, allow_exec: bool) -> Self {
+        self.allow_exec = allow_exec;
         self
     }
 }
@@ -122,6 +129,10 @@ impl AgentModel for OpenAiCompatibleAgentModel {
         let mut request = build_agent_chat_request(self.model.clone(), self.temperature, messages);
         if self.allow_write {
             request.tools.push(build_replace_text_tool());
+            request.tools.push(build_create_file_tool());
+        }
+        if self.allow_exec {
+            request.tools.push(build_run_command_tool());
         }
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -265,16 +276,50 @@ fn build_search_code_tool() -> ChatTool {
     }
 }
 
+fn build_run_command_tool() -> ChatTool {
+    ChatTool {
+        kind:"function".to_string(),
+        function:ChatFunctionDefinition {
+            name:"run_command".to_string(),
+            description:"Execute a program directly with an argument array (no implicit shell). cwd defaults to '.' and must be an existing workspace directory. timeout_seconds defaults to 60, allowed 1-300. stdout and stderr are independently capped at 32 KiB and drained concurrently. Returns success, exit_code, timed_out, stdout, stderr, truncation flags and duration_ms. Nonzero status and timeout are recoverable tool failures. stdin is closed. Unix processes run in a separate group, killed on timeout or cancellation; descendants can escape that group. Requires --allow-exec: arbitrary execution can write files and access the host beyond the workspace, independently of --allow-write. Not an OS sandbox.".to_string(),
+            parameters:serde_json::json!({
+                "type":"object","properties":{
+                    "program":{"type":"string","minLength":1},
+                    "args":{"type":"array","items":{"type":"string"},"maxItems":128},
+                    "cwd":{"type":"string","minLength":1},
+                    "timeout_seconds":{"type":"integer","minimum":1,"maximum":300}
+                },"required":["program","args"],"additionalProperties":false
+            }),
+        },
+    }
+}
+
+fn build_create_file_tool() -> ChatTool {
+    ChatTool {
+        kind:"function".to_string(),
+        function:ChatFunctionDefinition {
+            name:"create_file".to_string(),
+            description:"Create a new workspace UTF-8 file with initial content (maximum 1 MiB, no NUL bytes). Parent directory must already exist inside the workspace. Never overwrites an existing file, directory or symlink. Empty content creates an empty file. Returns path, created and bytes_written. Requires explicit write access. Use replace_text for existing files.".to_string(),
+            parameters:serde_json::json!({
+                "type":"object","properties":{
+                    "path":{"type":"string","minLength":1},
+                    "content":{"type":"string"}
+                },"required":["path","content"],"additionalProperties":false
+            }),
+        },
+    }
+}
+
 fn build_replace_text_tool() -> ChatTool {
     ChatTool {
         kind: "function".to_string(),
         function: ChatFunctionDefinition {
             name:"replace_text".to_string(),
-            description:"Replace one unique exact occurrence in an existing workspace UTF-8 regular file (maximum 1 MiB before and after). old_text must be nonempty and uniquely identify the edit, including overlapping occurrences. Preserve other content. Use read_file first. Returns applied, changed and a diff; diff_truncated marks an incomplete diff. Does not create or delete files. Conflicting content, read-only files and invalid paths return errors without writing. This tool is available only with explicit write access.".to_string(),
+            description:"Replace one unique exact occurrence in an existing workspace UTF-8 regular file (maximum 1 MiB before and after). Empty old_text is allowed only when the file is empty, to initialize it with new_text. For nonempty files old_text must be nonempty and uniquely identify the edit, including overlapping occurrences. Preserve other content. Use read_file first. Returns applied, changed and a diff; diff_truncated marks an incomplete diff. Does not create or delete files. Conflicting content, read-only files and invalid paths return errors without writing. This tool is available only with explicit write access.".to_string(),
             parameters:serde_json::json!({
                 "type":"object", "properties":{
                     "path":{"type":"string","minLength":1},
-                    "old_text":{"type":"string","minLength":1},
+                    "old_text":{"type":"string"},
                     "new_text":{"type":"string"}
                 },"required":["path","old_text","new_text"],"additionalProperties":false
             }),

@@ -29,6 +29,9 @@ pub enum Commands {
         /// Allow the agent to replace text in existing workspace files.
         #[arg(long)]
         allow_write: bool,
+        /// Allow arbitrary command execution, including writes; this is not sandboxed.
+        #[arg(long)]
+        allow_exec: bool,
         /// Maximum model turns; omitted means no turn budget.
         #[arg(long, value_parser = parse_positive_usize)]
         max_iterations: Option<usize>,

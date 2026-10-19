@@ -4,11 +4,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read, path::Path};
 
+mod command;
+mod create;
 mod edit;
 mod search;
 pub(crate) struct BuiltinToolExecutor {
     workspace: Workspace,
     allow_write: bool,
+    allow_exec: bool,
 }
 
 impl BuiltinToolExecutor {
@@ -16,11 +19,17 @@ impl BuiltinToolExecutor {
         Self {
             workspace,
             allow_write: false,
+            allow_exec: false,
         }
     }
 
     pub(crate) fn with_write_access(mut self, allow_write: bool) -> Self {
         self.allow_write = allow_write;
+        self
+    }
+
+    pub(crate) fn with_exec_access(mut self, allow_exec: bool) -> Self {
+        self.allow_exec = allow_exec;
         self
     }
 }
@@ -29,6 +38,30 @@ impl ToolExecutor for BuiltinToolExecutor {
     async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
         let result = match name {
             "add" => execute_add(input),
+            "run_command" => {
+                if !self.allow_exec {
+                    return Ok(ToolOutput::error(
+                        "execution access denied; enable --allow-exec to use run_command"
+                            .to_string(),
+                    ));
+                }
+                return Ok(match command::execute(&self.workspace, input).await {
+                    Ok(output) => output,
+                    Err(error) => ToolOutput::error(format!("{error:#}")),
+                });
+            }
+            "create_file" => {
+                if !self.allow_write {
+                    return Ok(ToolOutput::error(
+                        "write access denied; enable --allow-write to use create_file".to_string(),
+                    ));
+                }
+                let workspace = self.workspace.clone();
+                let input = input.to_string();
+                tokio::task::spawn_blocking(move || create::execute(&workspace, &input))
+                    .await
+                    .context("create_file worker failed")?
+            }
             "replace_text" => {
                 if !self.allow_write {
                     return Ok(ToolOutput::error(

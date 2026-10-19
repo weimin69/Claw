@@ -52,6 +52,7 @@ async fn run() -> Result<()> {
             prompt,
             workspace,
             allow_write,
+            allow_exec,
             max_iterations,
             max_tool_calls,
         } => {
@@ -60,6 +61,7 @@ async fn run() -> Result<()> {
                 prompt,
                 &workspace,
                 allow_write,
+                allow_exec,
                 max_iterations,
                 max_tool_calls,
             )
