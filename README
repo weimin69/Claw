@@ -46,9 +46,12 @@ Project Status
 
   [llm]
   base_url = "https://api.openai.com/v1"
-  api_key = ""
+  api_key = "xx"
   model = "gpt-4.1"
   temperature = 0.7
+
+
+
 
   src/
   ├── main.rs                 CLI entry and command dispatch
