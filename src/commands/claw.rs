@@ -1,5 +1,6 @@
-use crate::agent::{AgentRunResult, AgentSession, run_agent};
+use crate::agent::{AgentEvent, AgentRunResult, AgentSession, run_agent};
 use crate::openai_compatible::OpenAiCompatibleAgentModel;
+use crate::session::SessionStore;
 use crate::tools::BuiltinToolExecutor;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write, stdin};
@@ -22,6 +23,7 @@ pub(crate) struct ClawOptions<'a> {
     pub(crate) max_iterations: Option<usize>,
     pub(crate) max_tool_calls: Option<usize>,
     pub(crate) interactive: bool,
+    pub(crate) session_file: Option<&'a std::path::Path>,
 }
 
 pub async fn execute(
@@ -36,6 +38,7 @@ pub async fn execute(
         max_iterations,
         max_tool_calls,
         interactive,
+        session_file,
     } = options;
     let prompt = match (prompt, interactive) {
         (Some(value), _) => Some(value),
@@ -55,6 +58,9 @@ pub async fn execute(
     }
 
     let workspace = crate::workspace::Workspace::new(workspace_path)?;
+    let store = session_file
+        .map(|path| SessionStore::new(path, workspace.root()))
+        .transpose()?;
     let mut model =
         OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?
             .with_write_access(allow_write)
@@ -70,6 +76,7 @@ pub async fn execute(
             prompt,
             max_iterations,
             max_tool_calls,
+            store,
         )
         .await;
     }
@@ -81,7 +88,7 @@ pub async fn execute(
             signal.context("failed to listen for Ctrl+C")?;
             return Err(Cancelled.into());
         }
-        answer = run_agent(&mut model, prompt, max_iterations, max_tool_calls, &mut tool_executor) => answer?,
+        answer = run_agent(&mut model, prompt, max_iterations, max_tool_calls, &mut tool_executor, print_event) => answer?,
     };
 
     print_result(&result);
@@ -94,6 +101,7 @@ async fn run_interactive(
     mut prompt: Option<String>,
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
+    mut store: Option<SessionStore>,
 ) -> Result<()> {
     eprintln!("交互模式：每行一条消息，/exit 退出；会话仅保存在当前进程。");
     // A dedicated reader avoids blocking the runtime and Tokio stdin's
@@ -149,9 +157,51 @@ async fn run_interactive(
                 signal.context("failed to listen for Ctrl+C")?;
                 return Err(Cancelled.into());
             }
-            result = session.run_turn(model, input, max_iterations, max_tool_calls, tools) => result?,
+            result = session.run_turn(model, input, max_iterations, max_tool_calls, tools, print_event) => result?,
         };
         print_result(&result);
+        if let Some(mut writer) = store.take() {
+            let messages = session.completed_messages()?.to_vec();
+            writer = tokio::task::spawn_blocking(move || {
+                writer.save(messages)?;
+                Ok::<_, anyhow::Error>(writer)
+            })
+            .await
+            .context("answer completed, but session save worker failed")?
+            .context("answer completed, but session save failed")?;
+            store = Some(writer);
+            eprintln!("会话已保存。存档可能包含源码与敏感工具输出，请勿提交到 Git。");
+        }
+    }
+}
+
+fn print_event(event: AgentEvent) {
+    match event {
+        AgentEvent::ModelStarted { iteration } => eprintln!("[第 {iteration} 轮] 等待模型响应……"),
+        AgentEvent::ModelFinished {
+            iteration,
+            elapsed,
+            is_error,
+        } => {
+            let status = if is_error { "失败" } else { "完成" };
+            eprintln!(
+                "[第 {iteration} 轮] 模型响应{status}，耗时 {:.3}s",
+                elapsed.as_secs_f64()
+            );
+        }
+        AgentEvent::ToolStarted { name } => eprintln!("[工具 {}] 开始", name.escape_debug()),
+        AgentEvent::ToolFinished {
+            name,
+            elapsed,
+            is_error,
+        } => {
+            let status = if is_error { "失败" } else { "完成" };
+            eprintln!(
+                "[工具 {}] {status}，耗时 {:.3}s",
+                name.escape_debug(),
+                elapsed.as_secs_f64()
+            );
+        }
     }
 }
 

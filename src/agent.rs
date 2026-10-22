@@ -1,5 +1,27 @@
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgentEvent {
+    ModelStarted {
+        iteration: usize,
+    },
+    ModelFinished {
+        iteration: usize,
+        elapsed: Duration,
+        is_error: bool,
+    },
+    ToolStarted {
+        name: String,
+    },
+    ToolFinished {
+        name: String,
+        elapsed: Duration,
+        is_error: bool,
+    },
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AgentRunResult {
@@ -14,14 +36,15 @@ pub(crate) enum ModelDecision {
     ToolCalls(Vec<ToolCall>),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolCall {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) input: String,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub(crate) enum AgentMessage {
     User(String),
     Assistant(String),
@@ -134,6 +157,16 @@ pub(crate) struct AgentSession {
 }
 
 impl AgentSession {
+    /// Only completed turns may be persisted; never expose partial tool batches.
+    pub(crate) fn completed_messages(&self) -> Result<&[AgentMessage]> {
+        if self.closed {
+            bail!("cannot save an interrupted or failed session");
+        }
+        self.messages
+            .as_deref()
+            .context("session has no completed turn to save")
+    }
+
     pub(crate) async fn run_turn<M: AgentModel, T: ToolExecutor>(
         &mut self,
         model: &mut M,
@@ -141,6 +174,7 @@ impl AgentSession {
         max_iterations: Option<usize>,
         max_tool_calls: Option<usize>,
         tool_executor: &mut T,
+        on_event: impl FnMut(AgentEvent),
     ) -> Result<AgentRunResult> {
         if self.closed {
             bail!("agent session is closed after an interrupted or failed turn");
@@ -150,7 +184,7 @@ impl AgentSession {
         messages.append(&mut state.messages);
         state.messages = messages;
         self.closed = true;
-        let result = run_turn_loop(model, &mut state, tool_executor).await?;
+        let result = run_turn_loop(model, &mut state, tool_executor, on_event).await?;
         self.messages = Some(state.messages);
         self.closed = false;
         Ok(result)
@@ -163,9 +197,17 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
     tool_executor: &mut T,
+    on_event: impl FnMut(AgentEvent),
 ) -> Result<AgentRunResult> {
     AgentSession::default()
-        .run_turn(model, prompt, max_iterations, max_tool_calls, tool_executor)
+        .run_turn(
+            model,
+            prompt,
+            max_iterations,
+            max_tool_calls,
+            tool_executor,
+            on_event,
+        )
         .await
 }
 
@@ -173,11 +215,22 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
     model: &mut M,
     state: &mut AgentState,
     tool_executor: &mut T,
+    mut on_event: impl FnMut(AgentEvent),
 ) -> Result<AgentRunResult> {
     let mut tool_counts = BTreeMap::<String, usize>::new();
     loop {
         state.begin_iteration()?;
-        let decision = model.next_decision(&state.messages).await?;
+        on_event(AgentEvent::ModelStarted {
+            iteration: state.iteration,
+        });
+        let started = Instant::now();
+        let decision = model.next_decision(&state.messages).await;
+        on_event(AgentEvent::ModelFinished {
+            iteration: state.iteration,
+            elapsed: started.elapsed(),
+            is_error: decision.is_err(),
+        });
+        let decision = decision?;
         match decision {
             ModelDecision::FinalAnswer(answer) => {
                 state.messages.push(AgentMessage::Assistant(answer.clone()));
@@ -201,10 +254,20 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
                 for tool_call in tool_calls {
                     let count = tool_counts.entry(tool_call.name.clone()).or_default();
                     *count = count.checked_add(1).context("tool usage count overflow")?;
+                    on_event(AgentEvent::ToolStarted {
+                        name: tool_call.name.clone(),
+                    });
+                    let started = Instant::now();
                     let tool_output = tool_executor
                         .execute(&tool_call.name, &tool_call.input)
                         .await
-                        .with_context(|| format!("tool `{}` execution failed", tool_call.name))?;
+                        .with_context(|| format!("tool `{}` execution failed", tool_call.name));
+                    on_event(AgentEvent::ToolFinished {
+                        name: tool_call.name.clone(),
+                        elapsed: started.elapsed(),
+                        is_error: tool_output.as_ref().map_or(true, |output| output.is_error),
+                    });
+                    let tool_output = tool_output?;
 
                     state.messages.push(AgentMessage::ToolResult {
                         tool_call_id: tool_call.id,
@@ -304,9 +367,16 @@ mod tests {
             output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
-        let answer = run_agent(&mut model, "hello".to_string(), None, None, &mut tool)
-            .await
-            .unwrap();
+        let answer = run_agent(
+            &mut model,
+            "hello".to_string(),
+            None,
+            None,
+            &mut tool,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(answer.answer, "done");
         assert_eq!(tool.calls.len(), 40);
         assert_eq!(model.received_messages.len(), 11);
@@ -357,9 +427,16 @@ mod tests {
                 output: ToolOutput::success("5".to_string()),
                 calls: Vec::new(),
             };
-            let error = run_agent(&mut model, "hello".to_string(), Some(8), Some(1), &mut tool)
-                .await
-                .unwrap_err();
+            let error = run_agent(
+                &mut model,
+                "hello".to_string(),
+                Some(8),
+                Some(1),
+                &mut tool,
+                |_| {},
+            )
+            .await
+            .unwrap_err();
             assert_eq!(error.to_string(), "agent reached maximum tool calls");
             assert_eq!(tool.calls.len(), first_batch);
             assert_eq!(model.received_messages.len(), first_batch + 1);
@@ -380,9 +457,16 @@ mod tests {
             output: ToolOutput::success("5".to_string()),
             calls: Vec::new(),
         };
-        let answer = run_agent(&mut model, "hello".to_string(), Some(2), Some(1), &mut tool)
-            .await
-            .unwrap();
+        let answer = run_agent(
+            &mut model,
+            "hello".to_string(),
+            Some(2),
+            Some(1),
+            &mut tool,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(answer.answer, "5");
         assert_eq!(tool.calls.len(), 1);
     }
@@ -452,6 +536,7 @@ mod tests {
             Some(3),
             Some(32),
             &mut tool,
+            |_| {},
         )
         .await
         .unwrap();
@@ -459,6 +544,127 @@ mod tests {
         assert_eq!(answer.iterations, 1);
         assert!(answer.tool_calls.is_empty());
         assert!(tool.calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn events_preserve_order_and_report_recoverable_tool_failure() {
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "1".into(),
+                name: "add".into(),
+                input: "private input".into(),
+            }]),
+            ModelDecision::FinalAnswer("done".into()),
+        ]);
+        for is_error in [false, true] {
+            // Replay the same decision sequence without depending on real time or HTTP.
+            model.decisions = vec![
+                ModelDecision::ToolCalls(vec![ToolCall {
+                    id: "1".into(),
+                    name: "add".into(),
+                    input: "private input".into(),
+                }]),
+                ModelDecision::FinalAnswer("done".into()),
+            ]
+            .into();
+            let mut tools = FakeToolExecutor {
+                output: ToolOutput {
+                    content: "private output".into(),
+                    is_error,
+                },
+                calls: Vec::new(),
+            };
+            let mut events = Vec::new();
+            run_agent(
+                &mut model,
+                "hello".into(),
+                None,
+                None,
+                &mut tools,
+                |event| events.push(event),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(events.as_slice(), [
+                AgentEvent::ModelStarted { iteration: 1 },
+                AgentEvent::ModelFinished { iteration: 1, is_error: false, .. },
+                AgentEvent::ToolStarted { name },
+                AgentEvent::ToolFinished { is_error: failed, .. },
+                AgentEvent::ModelStarted { iteration: 2 },
+                AgentEvent::ModelFinished { iteration: 2, is_error: false, .. },
+            ] if name == "add" && *failed == is_error));
+            let logged = format!("{events:?}");
+            assert!(!logged.contains("private input"));
+            assert!(!logged.contains("private output"));
+        }
+    }
+
+    #[tokio::test]
+    async fn events_report_model_failure_before_propagating_error() {
+        let mut model = FakeModel::new(vec![]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("unused".into()),
+            calls: vec![],
+        };
+        let mut events = Vec::new();
+        assert!(
+            run_agent(
+                &mut model,
+                "hello".into(),
+                None,
+                None,
+                &mut tools,
+                |event| events.push(event)
+            )
+            .await
+            .is_err()
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ModelStarted { iteration: 1 },
+                AgentEvent::ModelFinished {
+                    iteration: 1,
+                    is_error: true,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn events_report_fatal_tool_failure_before_propagating_error() {
+        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![ToolCall {
+            id: "1".into(),
+            name: "add".into(),
+            input: "private".into(),
+        }])]);
+        let mut tools = FailingToolExecutor { calls: vec![] };
+        let mut events = Vec::new();
+        let error = run_agent(
+            &mut model,
+            "hello".into(),
+            None,
+            None,
+            &mut tools,
+            |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("tool `add` execution failed"));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::ModelStarted { iteration: 1 },
+                AgentEvent::ModelFinished {
+                    iteration: 1,
+                    is_error: false,
+                    ..
+                },
+                AgentEvent::ToolStarted { .. },
+                AgentEvent::ToolFinished { is_error: true, .. },
+            ]
+        ));
     }
 
     #[tokio::test]
@@ -478,11 +684,18 @@ mod tests {
         };
         let mut session = AgentSession::default();
         let first = session
-            .run_turn(&mut model, "options?".into(), Some(2), Some(1), &mut tool)
+            .run_turn(
+                &mut model,
+                "options?".into(),
+                Some(2),
+                Some(1),
+                &mut tool,
+                |_| {},
+            )
             .await
             .unwrap();
         let second = session
-            .run_turn(&mut model, "1".into(), Some(1), Some(1), &mut tool)
+            .run_turn(&mut model, "1".into(), Some(1), Some(1), &mut tool, |_| {})
             .await
             .unwrap();
         assert_eq!(first.iterations, 2);
@@ -513,6 +726,7 @@ mod tests {
     #[tokio::test]
     async fn session_rejects_reuse_after_failed_turn() {
         let mut session = AgentSession::default();
+        assert!(session.completed_messages().is_err());
         let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![])]);
         let mut tool = FakeToolExecutor {
             output: ToolOutput::success("unused".into()),
@@ -520,16 +734,17 @@ mod tests {
         };
         assert!(
             session
-                .run_turn(&mut model, "hello".into(), None, None, &mut tool)
+                .run_turn(&mut model, "hello".into(), None, None, &mut tool, |_| {})
                 .await
                 .is_err()
         );
         let error = session
-            .run_turn(&mut model, "retry".into(), None, None, &mut tool)
+            .run_turn(&mut model, "retry".into(), None, None, &mut tool, |_| {})
             .await
             .unwrap_err();
         assert!(error.to_string().contains("session is closed"));
         assert_eq!(model.received_messages.len(), 1);
+        assert!(session.completed_messages().is_err());
     }
 
     #[tokio::test]
@@ -548,9 +763,16 @@ mod tests {
         let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
         let mut tools = BuiltinToolExecutor::new(workspace);
 
-        let result = run_agent(&mut model, "hello".to_string(), None, None, &mut tools)
-            .await
-            .unwrap();
+        let result = run_agent(
+            &mut model,
+            "hello".to_string(),
+            None,
+            None,
+            &mut tools,
+            |_| {},
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.answer, "done");
         assert_eq!(result.iterations, 3);
@@ -593,6 +815,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool,
+            |_| {},
         )
         .await
         .unwrap();
@@ -648,6 +871,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await
         .unwrap();
@@ -714,6 +938,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await
         .unwrap();
@@ -751,6 +976,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await
         .unwrap_err();
@@ -777,6 +1003,7 @@ mod tests {
             Some(1),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await;
 
@@ -818,6 +1045,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         );
 
         let error = result.await.unwrap_err();
@@ -862,6 +1090,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await
         .unwrap();
@@ -908,6 +1137,7 @@ mod tests {
             Some(2),
             Some(32),
             &mut tool_executor,
+            |_| {},
         )
         .await
         .unwrap();

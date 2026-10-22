@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod config;
 mod openai_compatible;
+mod session;
 mod tools;
 mod workspace;
 
@@ -56,6 +57,7 @@ async fn run() -> Result<()> {
             max_iterations,
             max_tool_calls,
             interactive,
+            session_file,
         } => {
             commands::claw::execute(
                 &config_path,
@@ -67,6 +69,7 @@ async fn run() -> Result<()> {
                     max_iterations,
                     max_tool_calls,
                     interactive,
+                    session_file: session_file.as_deref(),
                 },
             )
             .await?;

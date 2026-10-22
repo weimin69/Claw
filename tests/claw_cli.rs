@@ -71,7 +71,11 @@ async fn interactive_claw_preserves_conversation_and_exits_on_command_or_eof() {
             .assert()
             .success()
             .stdout(contains("1. clear the file").and(contains("confirmed")))
-            .stderr(contains("交互模式"));
+            .stderr(
+                contains("交互模式")
+                    .and(contains("模型响应完成"))
+                    .and(contains("耗时")),
+            );
     }
 }
 
@@ -141,7 +145,7 @@ async fn interactive_claw_stops_on_model_failure_without_processing_next_input()
         .assert()
         .failure()
         .stdout(is_empty())
-        .stderr(contains("error:"));
+        .stderr(contains("error:").and(contains("模型响应失败")));
 }
 
 #[cfg(unix)]
@@ -220,7 +224,7 @@ async fn claw_only_exposes_and_executes_commands_with_exec_authorization() {
             .assert()
             .success()
             .stdout(contains("command result received"))
-            .stderr(is_empty());
+            .stderr(contains("等待模型响应").and(contains("模型响应完成")));
         let marker = directory.path().join("marker");
         assert_eq!(marker.exists(), allow_exec);
         if allow_exec {
@@ -303,7 +307,7 @@ async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
             .assert()
             .success()
             .stdout(contains("finished"))
-            .stderr(is_empty());
+            .stderr(contains("等待模型响应").and(contains("模型响应完成")));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             if allow_write { "new\n" } else { "old\n" }
@@ -383,7 +387,7 @@ async fn claw_only_creates_files_with_write_authorization() {
             .assert()
             .success()
             .stdout(contains("finished"))
-            .stderr(is_empty());
+            .stderr(contains("等待模型响应").and(contains("模型响应完成")));
         if allow_write {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         } else {
@@ -479,7 +483,8 @@ async fn claw_sigint_stops_running_command_and_descendants() {
         .await
         .unwrap();
     assert!(stdout.is_empty());
-    assert_eq!(stderr.trim(), "claw task cancelled");
+    assert!(stderr.contains("等待模型响应"));
+    assert!(stderr.contains("claw task cancelled"));
     tokio::time::sleep(Duration::from_millis(2200)).await;
     assert!(!directory.path().join("late").exists());
 }
@@ -577,7 +582,7 @@ async fn claw_lists_workspace_and_returns_answer() {
         .assert()
         .success()
         .stdout(contains("The project contains src."))
-        .stderr(is_empty());
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }
 
 #[tokio::test]
@@ -636,7 +641,7 @@ async fn claw_reads_file_and_returns_answer() {
         .assert()
         .success()
         .stdout(contains("The file defines main."))
-        .stderr(is_empty());
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }
 
 #[tokio::test]
@@ -699,7 +704,7 @@ async fn claw_searches_code_and_returns_answer() {
         .assert()
         .success()
         .stdout(contains("Found main in main.rs at line 1."))
-        .stderr(is_empty());
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }
 
 #[tokio::test]
@@ -876,7 +881,8 @@ async fn claw_cancels_pending_model_request_on_sigint() {
         .unwrap();
     assert_eq!(status.code(), Some(130));
     assert!(stdout.is_empty(), "unexpected stdout: {stdout}");
-    assert_eq!(stderr.trim(), "claw task cancelled");
+    assert!(stderr.contains("等待模型响应"));
+    assert!(stderr.contains("claw task cancelled"));
 }
 
 #[tokio::test]
@@ -931,7 +937,7 @@ temperature = 0.2
         .assert()
         .success()
         .stdout("Hello from Claw\n\n执行统计：\n工具调用：\n  无\n工具调用总数：0\nLoop 次数：1\n")
-        .stderr(is_empty());
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }
 
 #[tokio::test]
@@ -1052,5 +1058,5 @@ temperature = 0.2
         .assert()
         .success()
         .stdout("The result is 5\n\n执行统计：\n工具调用：\n  add: 1 次\n工具调用总数：1\nLoop 次数：2\n")
-        .stderr(is_empty());
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }

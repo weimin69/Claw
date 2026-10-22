@@ -26,6 +26,10 @@ pub enum Commands {
         /// Keep an in-memory conversation until /exit, EOF or Ctrl+C.
         #[arg(long)]
         interactive: bool,
+        /// Save completed interactive turns to a NEW file; parent must exist.
+        /// Contains potentially sensitive conversation and tool output.
+        #[arg(long, requires = "interactive")]
+        session_file: Option<std::path::PathBuf>,
         /// Project directory available to repository tools.
         #[arg(long, default_value = ".")]
         workspace: std::path::PathBuf,
