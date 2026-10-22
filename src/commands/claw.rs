@@ -24,6 +24,7 @@ pub(crate) struct ClawOptions<'a> {
     pub(crate) max_tool_calls: Option<usize>,
     pub(crate) interactive: bool,
     pub(crate) session_file: Option<&'a std::path::Path>,
+    pub(crate) resume: Option<&'a std::path::Path>,
 }
 
 pub async fn execute(
@@ -39,6 +40,7 @@ pub async fn execute(
         max_tool_calls,
         interactive,
         session_file,
+        resume,
     } = options;
     let prompt = match (prompt, interactive) {
         (Some(value), _) => Some(value),
@@ -58,9 +60,23 @@ pub async fn execute(
     }
 
     let workspace = crate::workspace::Workspace::new(workspace_path)?;
-    let store = session_file
-        .map(|path| SessionStore::new(path, workspace.root()))
-        .transpose()?;
+    let (store, session) = if let Some(path) = resume {
+        let path = path.to_path_buf();
+        let root = workspace.root().to_path_buf();
+        let (store, session) =
+            tokio::task::spawn_blocking(move || SessionStore::resume(&path, &root))
+                .await
+                .context("session load worker failed")??;
+        eprintln!("已恢复会话；写入和执行权限由本次启动参数决定。历史不代表当前磁盘状态。");
+        (Some(store), session)
+    } else {
+        (
+            session_file
+                .map(|path| SessionStore::new(path, workspace.root()))
+                .transpose()?,
+            AgentSession::default(),
+        )
+    };
     let mut model =
         OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?
             .with_write_access(allow_write)
@@ -77,6 +93,7 @@ pub async fn execute(
             max_iterations,
             max_tool_calls,
             store,
+            session,
         )
         .await;
     }
@@ -102,8 +119,9 @@ async fn run_interactive(
     max_iterations: Option<usize>,
     max_tool_calls: Option<usize>,
     mut store: Option<SessionStore>,
+    mut session: AgentSession,
 ) -> Result<()> {
-    eprintln!("交互模式：每行一条消息，/exit 退出；会话仅保存在当前进程。");
+    eprintln!("交互模式：每行一条消息，/exit 退出；只有指定存档参数才保存到磁盘。");
     // A dedicated reader avoids blocking the runtime and Tokio stdin's
     // non-cancellable read preventing shutdown when Ctrl+C is pressed.
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
@@ -124,7 +142,6 @@ async fn run_interactive(
             }
         }
     });
-    let mut session = AgentSession::default();
     loop {
         let input = match prompt.take() {
             Some(input) => input,

@@ -157,6 +157,13 @@ pub(crate) struct AgentSession {
 }
 
 impl AgentSession {
+    pub(crate) fn from_history(messages: Vec<AgentMessage>) -> Result<Self> {
+        validate_history(&messages)?;
+        Ok(Self {
+            messages: Some(messages),
+            closed: false,
+        })
+    }
     /// Only completed turns may be persisted; never expose partial tool batches.
     pub(crate) fn completed_messages(&self) -> Result<&[AgentMessage]> {
         if self.closed {
@@ -189,6 +196,54 @@ impl AgentSession {
         self.closed = false;
         Ok(result)
     }
+}
+
+/// Accept only complete turns in the same order produced by the runtime.
+pub(crate) fn validate_history(messages: &[AgentMessage]) -> Result<()> {
+    let mut expect_user = true;
+    let mut pending: std::collections::VecDeque<(&str, &str)> = Default::default();
+    if messages.is_empty() {
+        bail!("session history is empty");
+    }
+    for message in messages {
+        match message {
+            AgentMessage::User(text)
+                if expect_user && pending.is_empty() && !text.trim().is_empty() =>
+            {
+                expect_user = false;
+            }
+            AgentMessage::Assistant(_) if !expect_user && pending.is_empty() => {
+                expect_user = true;
+            }
+            AgentMessage::AssistantToolCalls(calls) if !expect_user && pending.is_empty() => {
+                if calls.is_empty() {
+                    bail!("session contains an empty tool call batch");
+                }
+                let mut ids = std::collections::HashSet::new();
+                for call in calls {
+                    if call.id.trim().is_empty()
+                        || call.name.trim().is_empty()
+                        || !ids.insert(&call.id)
+                    {
+                        bail!("session contains invalid or duplicate tool call IDs/names");
+                    }
+                    pending.push_back((&call.id, &call.name));
+                }
+            }
+            AgentMessage::ToolResult {
+                tool_call_id, name, ..
+            } if !expect_user => {
+                if pending.pop_front() != Some((tool_call_id.as_str(), name.as_str())) {
+                    bail!("session tool result does not match the pending tool call");
+                }
+            }
+            _ => bail!("invalid session message order"),
+        }
+    }
+    if !expect_user || !pending.is_empty() {
+        bail!("session contains an incomplete turn");
+    }
+    Ok(())
 }
 
 pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(

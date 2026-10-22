@@ -30,6 +30,9 @@ pub enum Commands {
         /// Contains potentially sensitive conversation and tool output.
         #[arg(long, requires = "interactive")]
         session_file: Option<std::path::PathBuf>,
+        /// Resume and update an existing session; permissions come from this invocation.
+        #[arg(long, requires = "interactive", conflicts_with = "session_file")]
+        resume: Option<std::path::PathBuf>,
         /// Project directory available to repository tools.
         #[arg(long, default_value = ".")]
         workspace: std::path::PathBuf,

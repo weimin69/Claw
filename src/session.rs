@@ -3,19 +3,21 @@
 //! intentionally has no credentials or execution authorization fields.
 use anyhow::{Context, Result, bail};
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::AgentMessage;
+use crate::agent::{AgentMessage, AgentSession, validate_history};
+
+const MAX_SESSION_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionFile {
     pub(crate) version: u32,
-    /// Canonical workspace path; the future loader must validate it on restore.
+    /// Canonical workspace path, checked against the current project on restore.
     pub(crate) workspace: PathBuf,
     pub(crate) messages: Vec<AgentMessage>,
 }
@@ -28,7 +30,80 @@ pub(crate) struct SessionStore {
     last_saved: Option<Vec<u8>>,
 }
 
+/// Return the exact bytes read as well as the validated snapshot, so subsequent
+/// writes compare against what was actually loaded, not a second filesystem read.
+pub(crate) fn load_session(path: &Path, workspace: &Path) -> Result<(SessionFile, Vec<u8>)> {
+    let file = std::fs::File::open(path).context("failed to open session file")?;
+    let metadata = file.metadata().context("failed to inspect session file")?;
+    if !metadata.is_file() {
+        bail!("session path must be a regular file");
+    }
+
+    if metadata.len() > MAX_SESSION_BYTES {
+        bail!("session file exceeds size limit");
+    }
+
+    let mut bytes = Vec::new();
+    file.take(MAX_SESSION_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read session file")?;
+
+    if bytes.len() as u64 > MAX_SESSION_BYTES {
+        bail!("session file exceeds size limit");
+    }
+
+    let mut snapshot: SessionFile =
+        serde_json::from_slice(&bytes).context("failed to parse session file")?;
+
+    if snapshot.version != 1 {
+        bail!("unsupported session version: {}", snapshot.version);
+    }
+
+    let saved_workspace = snapshot
+        .workspace
+        .canonicalize()
+        .context("failed to resolve saved workspace")?;
+
+    let current_workspace = workspace
+        .canonicalize()
+        .context("failed to resolve current workspace")?;
+
+    if !current_workspace.is_dir() {
+        bail!("session workspace must be a directory");
+    }
+
+    if saved_workspace != current_workspace {
+        bail!("session workspace does not match current workspace");
+    }
+
+    snapshot.workspace = saved_workspace;
+    validate_history(&snapshot.messages)?;
+    Ok((snapshot, bytes))
+}
+
 impl SessionStore {
+    pub(crate) fn resume(path: &Path, workspace: &Path) -> Result<(Self, AgentSession)> {
+        if !std::fs::symlink_metadata(path)
+            .context("failed to inspect resume file")?
+            .file_type()
+            .is_file()
+        {
+            bail!("resume path must be a regular file, not a symlink");
+        }
+        let path = path
+            .canonicalize()
+            .context("failed to resolve resume file")?;
+        let (snapshot, bytes) = load_session(&path, workspace)?;
+        let session = AgentSession::from_history(snapshot.messages)?;
+        Ok((
+            Self {
+                path,
+                workspace: snapshot.workspace,
+                last_saved: Some(bytes),
+            },
+            session,
+        ))
+    }
     pub(crate) fn new(path: &Path, workspace: &Path) -> Result<Self> {
         let name = path
             .file_name()
@@ -63,6 +138,9 @@ impl SessionStore {
             messages,
         };
         let bytes = serde_json::to_vec_pretty(&snapshot).context("failed to serialize session")?;
+        if bytes.len() as u64 > MAX_SESSION_BYTES {
+            bail!("session file exceeds size limit");
+        }
         let parent = self.path.parent().context("missing session directory")?;
         let mut temp = tempfile::NamedTempFile::new_in(parent)
             .context("failed to create session temporary file")?;
@@ -101,6 +179,233 @@ mod tests {
     use super::*;
     use crate::agent::ToolCall;
     use serde_json::json;
+
+    fn write_snapshot(path: &Path, workspace: &Path, version: u32) -> SessionFile {
+        let snapshot = SessionFile {
+            version,
+            workspace: workspace.to_path_buf(),
+            messages: vec![
+                AgentMessage::User("你好".into()),
+                AgentMessage::Assistant("hello".into()),
+            ],
+        };
+        std::fs::write(path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        snapshot
+    }
+
+    #[test]
+    fn resumed_store_updates_original_and_preserves_external_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let snapshot = write_snapshot(&path, directory.path(), 1);
+        let original = std::fs::read(&path).unwrap();
+        let (mut store, session) = SessionStore::resume(&path, directory.path()).unwrap();
+        assert_eq!(session.completed_messages().unwrap(), snapshot.messages);
+        assert_eq!(store.last_saved.as_ref().unwrap(), &original);
+        let mut messages = snapshot.messages.clone();
+        messages.extend([
+            AgentMessage::User("1".into()),
+            AgentMessage::Assistant("done".into()),
+        ]);
+        store.save(messages.clone()).unwrap();
+        assert_eq!(
+            load_session(&path, directory.path()).unwrap().0.messages,
+            messages
+        );
+        std::fs::write(&path, "external").unwrap();
+        assert!(store.save(messages).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external");
+    }
+
+    #[test]
+    fn rejects_incomplete_or_mispaired_history() {
+        let user = AgentMessage::User("hello".into());
+        let answer = AgentMessage::Assistant("done".into());
+        let call = ToolCall {
+            id: "1".into(),
+            name: "read_file".into(),
+            input: "{}".into(),
+        };
+        let batch = AgentMessage::AssistantToolCalls(vec![call.clone()]);
+        let result = AgentMessage::ToolResult {
+            tool_call_id: "1".into(),
+            name: "read_file".into(),
+            output: "text".into(),
+            is_error: false,
+        };
+        let mut wrong_id = result.clone();
+        if let AgentMessage::ToolResult { tool_call_id, .. } = &mut wrong_id {
+            *tool_call_id = "other".into();
+        }
+        let mut wrong_name = result.clone();
+        if let AgentMessage::ToolResult { name, .. } = &mut wrong_name {
+            *name = "other".into();
+        }
+        let mut blank_call = call.clone();
+        blank_call.id = " ".into();
+        for messages in [
+            vec![],
+            vec![answer.clone()],
+            vec![user.clone()],
+            vec![user.clone(), user.clone(), answer.clone()],
+            vec![user.clone(), result.clone(), answer.clone()],
+            vec![user.clone(), batch.clone()],
+            vec![user.clone(), batch.clone(), result.clone()],
+            vec![user.clone(), batch.clone(), answer.clone()],
+            vec![user.clone(), batch.clone(), wrong_id, answer.clone()],
+            vec![user.clone(), batch.clone(), wrong_name, answer.clone()],
+            vec![
+                user.clone(),
+                AgentMessage::AssistantToolCalls(vec![]),
+                answer.clone(),
+            ],
+            vec![
+                user.clone(),
+                AgentMessage::AssistantToolCalls(vec![call.clone(), call]),
+                result.clone(),
+                answer.clone(),
+            ],
+            vec![
+                user.clone(),
+                AgentMessage::AssistantToolCalls(vec![blank_call]),
+                result.clone(),
+                answer.clone(),
+            ],
+        ] {
+            assert!(AgentSession::from_history(messages).is_err());
+        }
+        assert!(AgentSession::from_history(vec![user, batch, result, answer]).is_ok());
+    }
+
+    #[test]
+    fn load_rejects_semantically_invalid_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let mut snapshot = write_snapshot(&path, directory.path(), 1);
+        snapshot.messages.pop();
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete turn")
+        );
+    }
+
+    #[test]
+    fn loads_snapshot_with_matching_canonical_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let mut expected = write_snapshot(&path, directory.path(), 1);
+        expected.workspace = directory.path().canonicalize().unwrap();
+        let loaded = load_session(&path, &directory.path().join(".")).unwrap().0;
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn rejects_unsupported_version_and_mismatched_or_invalid_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        write_snapshot(&path, directory.path(), 2);
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported session version")
+        );
+        write_snapshot(&path, other.path(), 1);
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("workspace does not match")
+        );
+        write_snapshot(&path, &directory.path().join("missing"), 1);
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("saved workspace")
+        );
+        write_snapshot(&path, directory.path(), 1);
+        assert!(
+            load_session(&path, &directory.path().join("missing"))
+                .unwrap_err()
+                .to_string()
+                .contains("current workspace")
+        );
+        let not_directory = directory.path().join("plain-file");
+        std::fs::write(&not_directory, "text").unwrap();
+        write_snapshot(&path, &not_directory, 1);
+        assert!(
+            load_session(&path, &not_directory)
+                .unwrap_err()
+                .to_string()
+                .contains("must be a directory")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_malformed_and_oversized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("failed to open")
+        );
+        for bytes in [b"not json".as_slice(), b"\xff", b"{}"] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(
+                load_session(&path, directory.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("failed to parse")
+            );
+        }
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        assert!(
+            load_session(&path, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+    }
+
+    #[test]
+    fn accepts_file_exactly_at_size_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.json");
+        let mut expected = write_snapshot(&path, directory.path(), 1);
+        expected.workspace = directory.path().canonicalize().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.resize(MAX_SESSION_BYTES as usize, b' ');
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(load_session(&path, directory.path()).unwrap().0, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checks_opened_target_type_and_allows_symlink_to_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            load_session(directory.path(), directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("regular file")
+        );
+        let path = directory.path().join("session.json");
+        write_snapshot(&path, directory.path(), 1);
+        let link = directory.path().join("link.json");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            load_session(&link, directory.path()).unwrap(),
+            load_session(&path, directory.path()).unwrap()
+        );
+    }
 
     #[test]
     fn saves_complete_snapshots_and_replaces_only_own_unchanged_file() {

@@ -58,6 +58,7 @@ async fn run() -> Result<()> {
             max_tool_calls,
             interactive,
             session_file,
+            resume,
         } => {
             commands::claw::execute(
                 &config_path,
@@ -70,6 +71,7 @@ async fn run() -> Result<()> {
                     max_tool_calls,
                     interactive,
                     session_file: session_file.as_deref(),
+                    resume: resume.as_deref(),
                 },
             )
             .await?;
