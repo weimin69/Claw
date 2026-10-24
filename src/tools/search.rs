@@ -50,7 +50,6 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
     let mut visited = 0; //统计以及检查的目录
     let mut output = SearchOutput::default();
 
-
     'walk: while let Some(path) = pending.pop() {
         let metadata = fs::symlink_metadata(&path).context("failed to inspect search path")?;
         if metadata.file_type().is_symlink() {

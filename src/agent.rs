@@ -23,6 +23,7 @@ pub(crate) enum AgentEvent {
     },
 }
 
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AgentRunResult {
     pub(crate) answer: String,
@@ -136,8 +137,7 @@ impl AgentState {
     fn begin_iteration(&mut self) -> Result<()> {
         if self
             .max_iterations
-            .is_some_and(|limit| self.iteration >= limit)
-        {
+            .is_some_and(|limit| self.iteration >= limit) {
             bail!("agent reached maximum iterations");
         }
         self.iteration = self

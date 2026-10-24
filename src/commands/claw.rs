@@ -42,10 +42,11 @@ pub async fn execute(
         session_file,
         resume,
     } = options;
-    let prompt = match (prompt, interactive) {
-        (Some(value), _) => Some(value),
-        (None, false) => Some(read_prompt_from_stdin()?),
-        (None, true) => None,
+
+    let prompt = match (prompt , interactive) {
+        (Some(value), _ ) => Some(value),
+        (None , false) => Some(read_prompt_from_stdin()?),
+        (None , true) => None,
     };
 
     if prompt.as_ref().is_some_and(|value| value.trim().is_empty()) {
