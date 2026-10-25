@@ -77,7 +77,7 @@ async fn cancellation_keeps_previous_completed_snapshot() {
     assert_eq!(status.code(), Some(130));
     assert_eq!(std::fs::read(path).unwrap(), before);
     let snapshot: Value = serde_json::from_slice(&before).unwrap();
-    assert_eq!(snapshot["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["full_history"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -118,13 +118,13 @@ async fn saves_each_completed_turn_only_when_explicitly_requested() {
         if save {
             let text = std::fs::read_to_string(&path).unwrap();
             let snapshot: Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(snapshot["version"], 1);
+            assert_eq!(snapshot["version"], 3);
             assert_eq!(
                 snapshot["workspace"],
                 directory.path().canonicalize().unwrap().to_str().unwrap()
             );
             assert_eq!(
-                snapshot["messages"],
+                snapshot["full_history"],
                 json!([
                     {"type":"user","data":"options\n"},
                     {"type":"assistant","data":"1. choose this"},
@@ -171,8 +171,8 @@ async fn failed_turn_preserves_last_completed_snapshot() {
         .failure()
         .stdout(contains("saved answer"));
     let snapshot: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(snapshot["messages"].as_array().unwrap().len(), 2);
-    assert_eq!(snapshot["messages"][1]["data"], "saved answer");
+    assert_eq!(snapshot["full_history"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["full_history"][1]["data"], "saved answer");
 }
 
 #[tokio::test]
@@ -211,7 +211,7 @@ async fn saves_tool_calls_and_recoverable_results_with_matching_ids() {
         .assert()
         .success();
     let snapshot: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let messages = snapshot["messages"].as_array().unwrap();
+    let messages = snapshot["full_history"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[1]["type"], "assistant_tool_calls");
     assert_eq!(messages[1]["data"][0]["id"], "missing-file");

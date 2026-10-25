@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Ok, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -22,7 +22,6 @@ pub(crate) enum AgentEvent {
         is_error: bool,
     },
 }
-
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AgentRunResult {
@@ -94,6 +93,13 @@ pub(crate) struct AgentState {
 }
 
 impl AgentState {
+    /// Record new events in both the model context and the unabridged history.
+    /// Existing context is never copied back into the history at turn completion.
+    fn record_message(&mut self, message: AgentMessage, full_history: &mut Vec<AgentMessage>) {
+        full_history.push(message.clone());
+        self.messages.push(message);
+    }
+
     pub(crate) fn new(
         prompt: String,
         max_iterations: Option<usize>,
@@ -137,7 +143,8 @@ impl AgentState {
     fn begin_iteration(&mut self) -> Result<()> {
         if self
             .max_iterations
-            .is_some_and(|limit| self.iteration >= limit) {
+            .is_some_and(|limit| self.iteration >= limit)
+        {
             bail!("agent reached maximum iterations");
         }
         self.iteration = self
@@ -150,18 +157,80 @@ impl AgentState {
 
 /// In-memory history. An interrupted/failed turn closes the session rather than
 /// reusing potentially incomplete assistant/tool message pairs.
-#[derive(Default)]
 pub(crate) struct AgentSession {
-    messages: Option<Vec<AgentMessage>>,
+    /// Original messages for persistence and audit; never replaced by a summary.
+    full_history: Vec<AgentMessage>,
+    /// The messages sent to the model. Temporarily owned by AgentState during a turn.
+    working_context: Option<Vec<AgentMessage>>,
     closed: bool,
+    max_context_bytes: usize,
+}
+
+pub(crate) const DEFAULT_MAX_CONTEXT_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
+pub(crate) struct ContextLimitExceeded {
+    pub(crate) actual: usize,
+    pub(crate) limit: usize,
+}
+
+impl std::fmt::Display for ContextLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "agent context exceeds size limit: {} bytes, limit {} bytes (internal message JSON, not tokens)",
+            self.actual, self.limit
+        )
+    }
+}
+impl std::error::Error for ContextLimitExceeded {}
+
+impl Default for AgentSession {
+    fn default() -> Self {
+        Self {
+            full_history: Vec::new(),
+            working_context: None,
+            closed: false,
+            max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
+        }
+    }
 }
 
 impl AgentSession {
+    pub(crate) fn from_parts(
+        full_history: Vec<AgentMessage>,
+        working_context: Vec<AgentMessage>,
+    ) -> Result<Self> {
+        validate_history(&working_context).context("invalid working context")?;
+        let mut session = Self::from_history(full_history)?;
+        session.working_context = Some(working_context);
+        Ok(session)
+    }
+
+    pub(crate) fn completed_context(&self) -> Result<&[AgentMessage]> {
+        self.completed_messages()?;
+        self.working_context
+            .as_deref()
+            .context("session has no completed working context")
+    }
+    pub(crate) fn set_context_limit(&mut self, limit: usize) -> Result<()> {
+        if limit == 0 {
+            bail!("max_context_bytes must be greater than 0");
+        }
+        self.max_context_bytes = limit;
+        Ok(())
+    }
+
+    pub(crate) fn can_continue(&self) -> bool {
+        !self.closed
+    }
     pub(crate) fn from_history(messages: Vec<AgentMessage>) -> Result<Self> {
         validate_history(&messages)?;
         Ok(Self {
-            messages: Some(messages),
+            working_context: Some(messages.clone()),
+            full_history: messages,
             closed: false,
+            max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
         })
     }
     /// Only completed turns may be persisted; never expose partial tool batches.
@@ -169,9 +238,10 @@ impl AgentSession {
         if self.closed {
             bail!("cannot save an interrupted or failed session");
         }
-        self.messages
-            .as_deref()
-            .context("session has no completed turn to save")
+        if self.full_history.is_empty() {
+            bail!("session has no completed turn to save");
+        }
+        Ok(&self.full_history)
     }
 
     pub(crate) async fn run_turn<M: AgentModel, T: ToolExecutor>(
@@ -187,12 +257,30 @@ impl AgentSession {
             bail!("agent session is closed after an interrupted or failed turn");
         }
         let mut state = AgentState::new(prompt, max_iterations, max_tool_calls)?;
-        let mut messages = self.messages.take().unwrap_or_default();
+        let had_context = self.working_context.is_some();
+        let mut messages = self.working_context.take().unwrap_or_default();
+        let previous_len = messages.len();
         messages.append(&mut state.messages);
         state.messages = messages;
+        if let Err(error) = check_context_size(&state.messages, self.max_context_bytes) {
+            state.messages.truncate(previous_len);
+            self.working_context = had_context.then_some(state.messages);
+            return Err(error);
+        }
         self.closed = true;
-        let result = run_turn_loop(model, &mut state, tool_executor, on_event).await?;
-        self.messages = Some(state.messages);
+        // The input is accepted only after preflight succeeds. Do not append
+        // rejected inputs, nor old working messages (which may later be summaries).
+        self.full_history.push(state.messages[previous_len].clone());
+        let result = run_turn_loop(
+            model,
+            &mut state,
+            tool_executor,
+            on_event,
+            self.max_context_bytes,
+            &mut self.full_history,
+        )
+        .await?;
+        self.working_context = Some(state.messages);
         self.closed = false;
         Ok(result)
     }
@@ -253,8 +341,11 @@ pub(crate) async fn run_agent<M: AgentModel, T: ToolExecutor>(
     max_tool_calls: Option<usize>,
     tool_executor: &mut T,
     on_event: impl FnMut(AgentEvent),
+    max_context_bytes: usize,
 ) -> Result<AgentRunResult> {
-    AgentSession::default()
+    let mut session = AgentSession::default();
+    session.set_context_limit(max_context_bytes)?;
+    session
         .run_turn(
             model,
             prompt,
@@ -271,10 +362,15 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
     state: &mut AgentState,
     tool_executor: &mut T,
     mut on_event: impl FnMut(AgentEvent),
+    max_context_bytes: usize,
+    full_history: &mut Vec<AgentMessage>,
 ) -> Result<AgentRunResult> {
     let mut tool_counts = BTreeMap::<String, usize>::new();
     loop {
         state.begin_iteration()?;
+
+        check_context_size(&state.messages, max_context_bytes)?;
+
         on_event(AgentEvent::ModelStarted {
             iteration: state.iteration,
         });
@@ -288,7 +384,7 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
         let decision = decision?;
         match decision {
             ModelDecision::FinalAnswer(answer) => {
-                state.messages.push(AgentMessage::Assistant(answer.clone()));
+                state.record_message(AgentMessage::Assistant(answer.clone()), full_history);
                 return Ok(AgentRunResult {
                     answer,
                     iterations: state.iteration,
@@ -302,9 +398,10 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
 
                 state.begin_tool_batch(tool_calls.len())?;
 
-                state
-                    .messages
-                    .push(AgentMessage::AssistantToolCalls(tool_calls.clone()));
+                state.record_message(
+                    AgentMessage::AssistantToolCalls(tool_calls.clone()),
+                    full_history,
+                );
 
                 for tool_call in tool_calls {
                     let count = tool_counts.entry(tool_call.name.clone()).or_default();
@@ -324,12 +421,15 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
                     });
                     let tool_output = tool_output?;
 
-                    state.messages.push(AgentMessage::ToolResult {
-                        tool_call_id: tool_call.id,
-                        name: tool_call.name,
-                        output: tool_output.content,
-                        is_error: tool_output.is_error,
-                    });
+                    state.record_message(
+                        AgentMessage::ToolResult {
+                            tool_call_id: tool_call.id,
+                            name: tool_call.name,
+                            output: tool_output.content,
+                            is_error: tool_output.is_error,
+                        },
+                        full_history,
+                    );
                 }
             }
         }
@@ -340,11 +440,207 @@ pub(crate) trait ToolExecutor {
     async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput>;
 }
 
+fn check_context_size(messages: &[AgentMessage], max_context_bytes: usize) -> Result<()> {
+    let bytes = serde_json::to_vec(messages).context("failed to serialize agent context")?;
+
+    if bytes.len() > max_context_bytes {
+        return Err(ContextLimitExceeded {
+            actual: bytes.len(),
+            limit: max_context_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::BuiltinToolExecutor;
     use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn full_history_and_working_context_record_each_new_message_once() {
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "add".into(),
+            input: "{}".into(),
+        };
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![call("a"), call("b")]),
+            ModelDecision::FinalAnswer("first answer".into()),
+            ModelDecision::FinalAnswer("second answer".into()),
+        ]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("result".into()),
+            calls: vec![],
+        };
+        let mut session = AgentSession::default();
+        session
+            .run_turn(&mut model, "first".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        session
+            .run_turn(&mut model, "second".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        let history = session.completed_messages().unwrap();
+        assert_eq!(history.len(), 7);
+        assert_eq!(session.working_context.as_deref().unwrap(), history);
+        assert_eq!(model.received_messages[2], history[..6]);
+        validate_history(history).unwrap();
+    }
+
+    #[tokio::test]
+    async fn budget_and_model_use_working_context_without_losing_original_history() {
+        let original = vec![
+            AgentMessage::User("old input".repeat(256)),
+            AgentMessage::Assistant("old answer".into()),
+            AgentMessage::User("recent input".into()),
+            AgentMessage::Assistant("recent answer".into()),
+        ];
+        let mut session = AgentSession::from_history(original.clone()).unwrap();
+        assert_eq!(session.working_context.as_deref().unwrap(), original);
+        // Simulate a future context-selection step; no automatic pruning or
+        // summarization is exposed to users in this implementation stage.
+        session.working_context = Some(original[2..].to_vec());
+        session.set_context_limit(512).unwrap();
+        assert!(check_context_size(&original, 512).is_err());
+        let mut model = FakeModel::new(vec![ModelDecision::FinalAnswer("continued".into())]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("unused".into()),
+            calls: vec![],
+        };
+        session
+            .run_turn(&mut model, "next".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            model.received_messages[0],
+            vec![
+                original[2].clone(),
+                original[3].clone(),
+                AgentMessage::User("next".into())
+            ]
+        );
+        let history = session.completed_messages().unwrap();
+        assert_eq!(&history[..4], original);
+        assert_eq!(history.len(), 6);
+        assert_eq!(session.working_context.as_ref().unwrap().len(), 4);
+        validate_history(history).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_input_leaves_both_histories_unchanged_after_restore() {
+        let original = vec![
+            AgentMessage::User("first".into()),
+            AgentMessage::Assistant("answer".into()),
+        ];
+        let mut session = AgentSession::from_history(original.clone()).unwrap();
+        session.set_context_limit(256).unwrap();
+        let mut model = FakeModel::new(vec![]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("unused".into()),
+            calls: vec![],
+        };
+        assert!(
+            session
+                .run_turn(&mut model, "x".repeat(1024), None, None, &mut tools, |_| {})
+                .await
+                .unwrap_err()
+                .is::<ContextLimitExceeded>()
+        );
+        assert_eq!(session.full_history, original);
+        assert_eq!(session.working_context.as_deref().unwrap(), original);
+        assert!(session.can_continue());
+        assert!(model.received_messages.is_empty());
+    }
+
+    #[test]
+    fn context_budget_counts_utf8_json_and_accepts_exact_boundary() {
+        let messages = vec![AgentMessage::User("你好\n\"Rust\"".into())];
+        let size = serde_json::to_vec(&messages).unwrap().len();
+        assert!(size > "你好\n\"Rust\"".chars().count());
+        check_context_size(&messages, size).unwrap();
+        let error = check_context_size(&messages, size - 1).unwrap_err();
+        let error = error.downcast_ref::<ContextLimitExceeded>().unwrap();
+        assert_eq!(error.actual, size);
+        assert_eq!(error.limit, size - 1);
+        assert!(AgentSession::default().set_context_limit(0).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_input_preserves_history_and_allows_retry_without_model_call() {
+        let mut session = AgentSession::default();
+        session.set_context_limit(512).unwrap();
+        let mut model = FakeModel::new(vec![
+            ModelDecision::FinalAnswer("hi".into()),
+            ModelDecision::FinalAnswer("continued".into()),
+        ]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("unused".into()),
+            calls: vec![],
+        };
+        session
+            .run_turn(&mut model, "hello".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        let before = session.completed_messages().unwrap().to_vec();
+        let mut events = vec![];
+        let error = session
+            .run_turn(
+                &mut model,
+                "x".repeat(1024),
+                None,
+                None,
+                &mut tools,
+                |event| events.push(event),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<ContextLimitExceeded>());
+        assert!(session.can_continue());
+        assert_eq!(session.completed_messages().unwrap(), before);
+        assert_eq!(model.received_messages.len(), 1);
+        assert!(events.is_empty());
+        assert!(tools.calls.is_empty());
+        session
+            .run_turn(&mut model, "ok".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(model.received_messages[1].len(), 3);
+        assert_eq!(
+            model.received_messages[1][2],
+            AgentMessage::User("ok".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_output_growth_stops_before_next_model_request_and_closes_session() {
+        let mut session = AgentSession::default();
+        session.set_context_limit(512).unwrap();
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call".into(),
+                name: "read_file".into(),
+                input: "{}".into(),
+            }]),
+            ModelDecision::FinalAnswer("must not be requested".into()),
+        ]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("x".repeat(1024)),
+            calls: vec![],
+        };
+        let error = session
+            .run_turn(&mut model, "hello".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.is::<ContextLimitExceeded>());
+        assert_eq!(model.received_messages.len(), 1);
+        assert_eq!(tools.calls.len(), 1);
+        assert!(!session.can_continue());
+        assert!(session.completed_messages().is_err());
+    }
 
     struct FakeToolExecutor {
         output: ToolOutput,
@@ -429,6 +725,7 @@ mod tests {
             None,
             &mut tool,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -489,6 +786,7 @@ mod tests {
                 Some(1),
                 &mut tool,
                 |_| {},
+                DEFAULT_MAX_CONTEXT_BYTES,
             )
             .await
             .unwrap_err();
@@ -519,6 +817,7 @@ mod tests {
             Some(1),
             &mut tool,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -592,6 +891,7 @@ mod tests {
             Some(32),
             &mut tool,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -637,6 +937,7 @@ mod tests {
                 None,
                 &mut tools,
                 |event| events.push(event),
+                DEFAULT_MAX_CONTEXT_BYTES,
             )
             .await
             .unwrap();
@@ -669,7 +970,8 @@ mod tests {
                 None,
                 None,
                 &mut tools,
-                |event| events.push(event)
+                |event| events.push(event),
+                DEFAULT_MAX_CONTEXT_BYTES
             )
             .await
             .is_err()
@@ -703,6 +1005,7 @@ mod tests {
             None,
             &mut tools,
             |event| events.push(event),
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap_err();
@@ -825,6 +1128,7 @@ mod tests {
             None,
             &mut tools,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -871,6 +1175,7 @@ mod tests {
             Some(32),
             &mut tool,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -927,6 +1232,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -994,6 +1300,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -1032,6 +1339,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap_err();
@@ -1059,6 +1367,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await;
 
@@ -1101,6 +1410,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         );
 
         let error = result.await.unwrap_err();
@@ -1146,6 +1456,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();
@@ -1193,6 +1504,7 @@ mod tests {
             Some(32),
             &mut tool_executor,
             |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
         )
         .await
         .unwrap();

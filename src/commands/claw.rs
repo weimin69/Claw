@@ -1,4 +1,4 @@
-use crate::agent::{AgentEvent, AgentRunResult, AgentSession, run_agent};
+use crate::agent::{AgentEvent, AgentRunResult, AgentSession, ContextLimitExceeded, run_agent};
 use crate::openai_compatible::OpenAiCompatibleAgentModel;
 use crate::session::SessionStore;
 use crate::tools::BuiltinToolExecutor;
@@ -22,6 +22,7 @@ pub(crate) struct ClawOptions<'a> {
     pub(crate) allow_exec: bool,
     pub(crate) max_iterations: Option<usize>,
     pub(crate) max_tool_calls: Option<usize>,
+    pub(crate) max_context_bytes: usize,
     pub(crate) interactive: bool,
     pub(crate) session_file: Option<&'a std::path::Path>,
     pub(crate) resume: Option<&'a std::path::Path>,
@@ -38,15 +39,16 @@ pub async fn execute(
         allow_exec,
         max_iterations,
         max_tool_calls,
+        max_context_bytes,
         interactive,
         session_file,
         resume,
     } = options;
 
-    let prompt = match (prompt , interactive) {
-        (Some(value), _ ) => Some(value),
-        (None , false) => Some(read_prompt_from_stdin()?),
-        (None , true) => None,
+    let prompt = match (prompt, interactive) {
+        (Some(value), _) => Some(value),
+        (None, false) => Some(read_prompt_from_stdin()?),
+        (None, true) => None,
     };
 
     if prompt.as_ref().is_some_and(|value| value.trim().is_empty()) {
@@ -61,7 +63,7 @@ pub async fn execute(
     }
 
     let workspace = crate::workspace::Workspace::new(workspace_path)?;
-    let (store, session) = if let Some(path) = resume {
+    let (store, mut session) = if let Some(path) = resume {
         let path = path.to_path_buf();
         let root = workspace.root().to_path_buf();
         let (store, session) =
@@ -78,6 +80,7 @@ pub async fn execute(
             AgentSession::default(),
         )
     };
+    session.set_context_limit(max_context_bytes)?;
     let mut model =
         OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?
             .with_write_access(allow_write)
@@ -101,12 +104,12 @@ pub async fn execute(
     let prompt = prompt.context("missing prompt")?;
 
     let result = tokio::select! {
-        biased;
+        biased;//？
         signal = tokio::signal::ctrl_c() => {
             signal.context("failed to listen for Ctrl+C")?;
             return Err(Cancelled.into());
         }
-        answer = run_agent(&mut model, prompt, max_iterations, max_tool_calls, &mut tool_executor, print_event) => answer?,
+        answer = run_agent(&mut model, prompt, max_iterations, max_tool_calls, &mut tool_executor, print_event, max_context_bytes) => answer?,
     };
 
     print_result(&result);
@@ -175,13 +178,31 @@ async fn run_interactive(
                 signal.context("failed to listen for Ctrl+C")?;
                 return Err(Cancelled.into());
             }
-            result = session.run_turn(model, input, max_iterations, max_tool_calls, tools, print_event) => result?,
+            result = session.run_turn(model, input, max_iterations, max_tool_calls, tools, print_event) => result,
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) if error.is::<ContextLimitExceeded>() && session.can_continue() => {
+                eprintln!(
+                    "{error}；本次输入未发送，原历史已保留。请缩短输入，或退出后开启新会话/调整预算。"
+                );
+                continue;
+            }
+            Err(error) => {
+                if error.is::<ContextLimitExceeded>() {
+                    eprintln!(
+                        "工具执行后上下文超限，停止当前会话；保留上次成功存档，已执行的文件或命令操作不会回滚。"
+                    );
+                }
+                return Err(error);
+            }
         };
         print_result(&result);
         if let Some(mut writer) = store.take() {
             let messages = session.completed_messages()?.to_vec();
+            let context = session.completed_context()?.to_vec();
             writer = tokio::task::spawn_blocking(move || {
-                writer.save(messages)?;
+                writer.save(messages, context)?;
                 Ok::<_, anyhow::Error>(writer)
             })
             .await

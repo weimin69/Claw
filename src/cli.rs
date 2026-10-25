@@ -48,6 +48,9 @@ pub enum Commands {
         /// Maximum tool calls across the task; omitted means no tool budget.
         #[arg(long, value_parser = parse_positive_usize)]
         max_tool_calls: Option<usize>,
+        /// Internal history JSON byte budget (not tokens or full HTTP size).
+        #[arg(long, default_value_t = crate::agent::DEFAULT_MAX_CONTEXT_BYTES, value_parser = parse_positive_usize)]
+        max_context_bytes: usize,
     },
 }
 fn parse_positive_usize(value: &str) -> Result<usize, String> {

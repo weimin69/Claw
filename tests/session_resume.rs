@@ -25,6 +25,73 @@ fn snapshot(path: &Path, workspace: &Path) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
+    let server = MockServer::start().await;
+    let config = config(&server);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v2.json");
+    let working = json!([
+        {"type":"user","data":"recent request"},
+        {"type":"assistant","data":"recent answer"}
+    ]);
+    let full = json!([
+        {"type":"user","data":"original details ".repeat(256)},
+        {"type":"assistant","data":"old answer"},
+        working[0], working[1]
+    ]);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "version":2,"workspace":directory.path().canonicalize().unwrap(),
+            "full_history":full,"working_context":working
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            assert_eq!(
+                body["messages"],
+                json!([
+                    {"role":"user","content":"recent request"},
+                    {"role":"assistant","content":"recent answer"},
+                    {"role":"user","content":"next\n"}
+                ])
+            );
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"choices":[{"message":{"content":"continued"}}]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("--interactive")
+        .arg("--workspace")
+        .arg(directory.path())
+        .arg("--resume")
+        .arg(&path)
+        .args(["--max-context-bytes", "512"])
+        .write_stdin("next\n/exit\n")
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success();
+    let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved["version"], 3);
+    assert_eq!(
+        &saved["full_history"].as_array().unwrap()[..4],
+        full.as_array().unwrap()
+    );
+    assert_eq!(saved["full_history"].as_array().unwrap().len(), 6);
+    assert_eq!(saved["context"], json!({"prefix":[],"recent_start":2}));
+    assert!(saved.get("working_context").is_none());
+    assert_eq!(saved["full_history"][5]["data"], "continued");
+}
+
+#[tokio::test]
 async fn resumes_across_processes_updates_file_and_does_not_restore_permissions() {
     let server = MockServer::start().await;
     let config = config(&server);
@@ -91,10 +158,10 @@ async fn resumes_across_processes_updates_file_and_does_not_restore_permissions(
         .stderr(contains("已恢复会话"));
     assert!(!directory.path().join("marker").exists());
     let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(saved["messages"].as_array().unwrap().len(), 6);
-    assert_eq!(saved["messages"][4]["data"]["is_error"], true);
+    assert_eq!(saved["full_history"].as_array().unwrap().len(), 6);
+    assert_eq!(saved["full_history"][4]["data"]["is_error"], true);
     assert!(
-        saved["messages"][5]["data"]
+        saved["full_history"][5]["data"]
             .as_str()
             .unwrap()
             .starts_with("I remember")
