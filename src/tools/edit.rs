@@ -8,12 +8,53 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const MAX_EDITS: usize = 100;
+
+#[derive(Deserialize)]
+#[serde(from = "ReplaceTextRequest")]
+struct ReplaceTextInput {
+    path: String,
+    edits: Vec<TextEdit>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReplaceTextRequest {
+    Batch(BatchInput),
+    Single(SingleInput),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ReplaceTextInput {
+struct BatchInput {
+    path: String,
+    edits: Vec<TextEdit>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SingleInput {
     path: String,
     old_text: String,
     new_text: String,
+}
+
+impl From<ReplaceTextRequest> for ReplaceTextInput {
+    fn from(request: ReplaceTextRequest) -> Self {
+        match request {
+            ReplaceTextRequest::Batch(input) => Self {
+                path: input.path,
+                edits: input.edits,
+            },
+            ReplaceTextRequest::Single(input) => Self {
+                path: input.path,
+                edits: vec![TextEdit {
+                    old_text: input.old_text,
+                    new_text: input.new_text,
+                }],
+            },
+        }
+    }
 }
 
 /// An in-memory proposal. Original content is retained for the save-time
@@ -24,6 +65,13 @@ struct EditPlan {
     original: String,
     updated: String,
     diff: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextEdit {
+    old_text: String,
+    new_text: String,
 }
 
 pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
@@ -62,6 +110,9 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
 
 /// Prepare a proposal only; never writes to disk or sends content to the model.
 fn prepare_edit(workspace: &Workspace, input: ReplaceTextInput) -> Result<EditPlan> {
+    if input.edits.is_empty() || input.edits.len() > MAX_EDITS {
+        bail!("edits must contain between 1 and {MAX_EDITS} replacements");
+    }
     if input.path.trim().is_empty() {
         bail!("path must not be empty");
     }
@@ -84,34 +135,15 @@ fn prepare_edit(workspace: &Workspace, input: ReplaceTextInput) -> Result<EditPl
     if bytes.len() > MAX_READ_FILE_BYTES {
         bail!("replace_text file exceeds 1 MiB limit");
     }
-    if bytes.contains(&0) || input.new_text.contains('\0') {
+    if bytes.contains(&0) {
         bail!("replace_text does not support NUL bytes");
     }
     let content = std::str::from_utf8(&bytes).context("replace_text requires UTF-8 text")?;
-    if input.old_text.is_empty() && !content.is_empty() {
-        bail!("old_text must not be empty for a nonempty file");
+    let mut updated = content.to_string();
+    for (index, edit) in input.edits.iter().enumerate() {
+        updated = replace_once(&updated, edit)
+            .map_err(|error| anyhow::anyhow!("edit {} failed: {error:#}", index + 1))?;
     }
-    if !input.old_text.is_empty() {
-        let position = content
-            .find(&input.old_text)
-            .context("old_text was not found in file")?;
-        // Check overlapping matches too: "aa" in "aaa" is ambiguous.
-        let next = position
-            + input
-                .old_text
-                .chars()
-                .next()
-                .context("old_text must not be empty")?
-                .len_utf8();
-        if content[next..].contains(&input.old_text) {
-            bail!("old_text matches multiple locations; provide more surrounding context");
-        }
-    }
-    let retained = content.len() - input.old_text.len();
-    if input.new_text.len() > MAX_READ_FILE_BYTES - retained {
-        bail!("replace_text result exceeds 1 MiB limit");
-    }
-    let updated = content.replacen(&input.old_text, &input.new_text, 1);
     let relative = path
         .strip_prefix(workspace.root())?
         .to_str()
@@ -123,6 +155,37 @@ fn prepare_edit(workspace: &Workspace, input: ReplaceTextInput) -> Result<EditPl
         updated,
         diff,
     })
+}
+
+/// Apply one unique replacement to the current in-memory content.
+fn replace_once(content: &str, edit: &TextEdit) -> Result<String> {
+    if edit.old_text.contains('\0') || edit.new_text.contains('\0') {
+        bail!("replace_text does not support NUL bytes");
+    }
+    if edit.old_text.is_empty() && !content.is_empty() {
+        bail!("old_text must not be empty for a nonempty file");
+    }
+    if !edit.old_text.is_empty() {
+        let position = content
+            .find(&edit.old_text)
+            .context("old_text was not found in file")?;
+        // Check overlapping matches too: "aa" in "aaa" is ambiguous.
+        let next = position
+            + edit
+                .old_text
+                .chars()
+                .next()
+                .context("old_text must not be empty")?
+                .len_utf8();
+        if content[next..].contains(&edit.old_text) {
+            bail!("old_text matches multiple locations; provide more surrounding context");
+        }
+    }
+    let retained = content.len() - edit.old_text.len();
+    if edit.new_text.len() > MAX_READ_FILE_BYTES - retained {
+        bail!("replace_text result exceeds 1 MiB limit");
+    }
+    Ok(content.replacen(&edit.old_text, &edit.new_text, 1))
 }
 
 /// Save a prepared edit using a same-directory temporary file. The caller must
@@ -149,10 +212,12 @@ fn apply_edit(workspace: &Workspace, plan: &EditPlan) -> Result<()> {
         .context("failed to sync temporary edit file")?;
 
     // Recheck after preparing the temporary file, as close to rename as possible.
+    // here has times to rewrite the temoprary file to the current file.
     let current_permissions = validate_edit_target(workspace, plan)?;
     if current_permissions != permissions {
         bail!("edit target permissions changed; prepare a new edit");
     }
+    //check the before premsission and the futher permsission
     temporary
         .persist(&plan.path)
         .map_err(|error| error.error)
@@ -190,8 +255,9 @@ fn validate_edit_target(workspace: &Workspace, plan: &EditPlan) -> Result<std::f
     Ok(metadata.permissions())
 }
 
-/// A single replacement needs only one hunk, with three unchanged context
-/// lines on either side. Comparing common ends avoids quadratic diff work.
+/// Show the changed span in one hunk, with three context lines on either side.
+/// Multiple edits may include unchanged lines inside the span. Comparing common
+/// ends avoids quadratic diff work; execute bounds the returned diff size.
 fn replacement_diff(path: &str, original: &str, updated: &str) -> String {
     if original == updated {
         return String::new();
@@ -248,6 +314,111 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn batch_replacements_save_all_changes_and_report_combined_diff() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        fs::write(&path, "first\r\nkeep\r\n最后\r\n").unwrap();
+        let result = execute(
+            &workspace,
+            &serde_json::json!({"path":"file","edits":[
+                {"old_text":"first","new_text":"start"},
+                {"old_text":"最后","new_text":"结束"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "start\r\nkeep\r\n结束\r\n"
+        );
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["applied"], true);
+        let diff = result["diff"].as_str().unwrap();
+        for line in ["-first", "+start", "-最后", "+结束"] {
+            assert!(diff.contains(line));
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn batch_replacements_match_intermediate_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        fs::write(&path, "").unwrap();
+        execute(
+            &workspace,
+            &serde_json::json!({"path":"file","edits":[
+                {"old_text":"","new_text":"first"},
+                {"old_text":"first","new_text":"second"},
+                {"old_text":"second","new_text":"third"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "third");
+    }
+
+    #[test]
+    fn failed_later_edit_never_saves_earlier_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        for (old, new, reason) in [
+            ("missing".to_string(), "x".to_string(), "was not found"),
+            ("aa".to_string(), "x".to_string(), "multiple locations"),
+            ("".to_string(), "x".to_string(), "nonempty file"),
+            ("aaa".to_string(), "\0".to_string(), "NUL bytes"),
+            (
+                "aaa".to_string(),
+                "x".repeat(MAX_READ_FILE_BYTES + 1),
+                "result exceeds",
+            ),
+        ] {
+            fs::write(&path, "original").unwrap();
+            let error = execute(
+                &workspace,
+                &serde_json::json!({"path":"file","edits":[
+                    {"old_text":"original","new_text":"aaa"},
+                    {"old_text":old,"new_text":new}
+                ]})
+                .to_string(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("edit 2 failed"), "{error}");
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn batch_input_rejects_mixed_unknown_missing_and_empty_fields() {
+        use serde_json::json;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(directory.path()).unwrap();
+        let path = directory.path().join("file");
+        fs::write(&path, "original").unwrap();
+        let edit = json!({"old_text":"original","new_text":"updated"});
+        for request in [
+            json!({"path":"file","edits":[]}),
+            json!({"path":"file","edits":vec![edit.clone(); MAX_EDITS + 1]}),
+            json!({"path":"file","edits":[edit.clone()],"old_text":"original","new_text":"x"}),
+            json!({"path":"file","edits":[edit.clone()],"old_text":null}),
+            json!({"path":"file","edits":[{"old_text":"original"}]}),
+            json!({"path":"file","edits":[{"old_text":"original","new_text":"x","extra":true}]}),
+            json!({"path":"file","edits":[edit],"extra":true}),
+        ] {
+            assert!(
+                execute(&workspace, &request.to_string()).is_err(),
+                "{request}"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        }
+    }
+
+    #[test]
     fn execute_bounds_diff_without_losing_the_applied_result() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = Workspace::new(directory.path()).unwrap();
@@ -270,8 +441,10 @@ mod tests {
     fn input(old: &str, new: &str) -> ReplaceTextInput {
         ReplaceTextInput {
             path: "file".to_string(),
-            old_text: old.to_string(),
-            new_text: new.to_string(),
+            edits: vec![TextEdit {
+                old_text: old.to_string(),
+                new_text: new.to_string(),
+            }],
         }
     }
 

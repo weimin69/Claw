@@ -102,7 +102,7 @@ async fn interactive_claw_cancels_while_waiting_for_user_input() {
         let mut output = Vec::new();
         loop {
             output.push(stderr.read_u8().await.unwrap());
-            if output.ends_with("你> ".as_bytes()) {
+            if output.ends_with(b">#> ") {
                 break;
             }
         }
@@ -247,8 +247,25 @@ async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
         Mock::given(method("POST"))
             .and(move |request: &wiremock::Request| {
                 let body: serde_json::Value = request.body_json().unwrap();
-                let edit_tool = body["tools"].as_array().unwrap().iter()
-                    .any(|tool| tool["function"]["name"] == "replace_text");
+                let edit_tool = body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|tool| tool["function"]["name"] == "replace_text");
+                if let Some(tool) = edit_tool {
+                    assert_eq!(
+                        tool["function"]["parameters"]["properties"]["edits"]["maxItems"],
+                        100
+                    );
+                    assert_eq!(
+                        tool["function"]["parameters"]["oneOf"]
+                            .as_array()
+                            .unwrap()
+                            .len(),
+                        2
+                    );
+                }
+                let edit_tool = edit_tool.is_some();
                 body["messages"].as_array().unwrap().len() == 1 && edit_tool == allow_write
             })
             // Also send a forged call when the schema is hidden: executor
@@ -256,10 +273,16 @@ async fn claw_only_exposes_and_executes_edits_with_write_authorization() {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices":[{"message":{"content":null,"tool_calls":[{
                     "id":"edit-1","type":"function","function":{
-                        "name":"replace_text","arguments":"{\"path\":\"file\",\"old_text\":\"old\",\"new_text\":\"new\"}"
+                        "name":"replace_text","arguments":serde_json::json!({"path":"file","edits":[
+                            {"old_text":"old","new_text":"intermediate"},
+                            {"old_text":"intermediate","new_text":"new"}
+                        ]}).to_string()
                     }
                 }]}}]
-            }))).expect(1).mount(&server).await;
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(move |request: &wiremock::Request| {
                 let body: serde_json::Value = request.body_json().unwrap();

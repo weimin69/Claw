@@ -13,6 +13,108 @@ use crate::agent::{AgentMessage, AgentSession, validate_history};
 
 const MAX_SESSION_BYTES: u64 = 16 * 1024 * 1024;
 
+pub(crate) struct SessionEntry {
+    pub(crate) created_ms: u128,
+    pub(crate) filename: String,
+    pub(crate) preview: String,
+}
+
+#[derive(Default)]
+pub(crate) struct SessionListing {
+    pub(crate) entries: Vec<SessionEntry>,
+    pub(crate) skipped: usize,
+    pub(crate) incomplete: bool,
+}
+
+/// Bounded listing only: never creates, rewrites or restores an archive.
+pub(crate) fn list_sessions(workspace: &Path) -> Result<SessionListing> {
+    const MAX_SCAN: usize = 1000;
+    const MAX_LIST: usize = 20;
+    const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+    let mut directory = workspace.to_path_buf();
+    for component in [".agent-cli", "sessions"] {
+        directory.push(component);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => bail!("session listing directory must not be a symlink or file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SessionListing::default());
+            }
+            Err(error) => return Err(error).context("failed to inspect session listing directory"),
+        }
+    }
+    let mut listing = SessionListing::default();
+    let mut candidates = Vec::new();
+    for (index, entry) in std::fs::read_dir(directory)?.enumerate() {
+        if index == MAX_SCAN {
+            listing.incomplete = true;
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                listing.skipped += 1;
+                continue;
+            }
+        };
+        let filename = entry.file_name();
+        let Some(filename) = filename.to_str() else {
+            continue;
+        };
+        if !filename.ends_with(".json") {
+            continue;
+        }
+        let Some(created_ms) = filename
+            .split_once('-')
+            .and_then(|(time, _)| time.parse::<u128>().ok())
+        else {
+            continue;
+        };
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) if metadata.is_file() && metadata.len() <= MAX_SESSION_BYTES => metadata,
+            _ => {
+                listing.skipped += 1;
+                continue;
+            }
+        };
+        candidates.push((
+            created_ms,
+            filename.to_string(),
+            entry.path(),
+            metadata.len(),
+        ));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut bytes = 0;
+    for (created_ms, filename, path, size) in candidates {
+        if listing.entries.len() == MAX_LIST || size + 1 > MAX_TOTAL_BYTES - bytes {
+            listing.incomplete = true;
+            break;
+        }
+        // Reserve an additional byte per read for load_session's growth check.
+        bytes += size + 1;
+        match load_session_bounded(&path, workspace, size) {
+            Ok((snapshot, _)) => {
+                let Some(AgentMessage::User(text)) = snapshot.full_history.first() else {
+                    listing.skipped += 1;
+                    continue;
+                };
+                let mut preview: String = text.chars().take(80).collect();
+                if text.chars().nth(80).is_some() {
+                    preview.push('…');
+                }
+                listing.entries.push(SessionEntry {
+                    created_ms,
+                    filename,
+                    preview,
+                });
+            }
+            Err(_) => listing.skipped += 1,
+        }
+    }
+    Ok(listing)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SessionFile {
     pub(crate) version: u32,
@@ -169,22 +271,30 @@ pub(crate) struct SessionStore {
 /// Return the exact bytes read as well as the validated snapshot, so subsequent
 /// writes compare against what was actually loaded, not a second filesystem read.
 pub(crate) fn load_session(path: &Path, workspace: &Path) -> Result<(SessionFile, Vec<u8>)> {
+    load_session_bounded(path, workspace, MAX_SESSION_BYTES)
+}
+
+fn load_session_bounded(
+    path: &Path,
+    workspace: &Path,
+    limit: u64,
+) -> Result<(SessionFile, Vec<u8>)> {
     let file = std::fs::File::open(path).context("failed to open session file")?;
     let metadata = file.metadata().context("failed to inspect session file")?;
     if !metadata.is_file() {
         bail!("session path must be a regular file");
     }
 
-    if metadata.len() > MAX_SESSION_BYTES {
+    if metadata.len() > limit {
         bail!("session file exceeds size limit");
     }
 
     let mut bytes = Vec::new();
-    file.take(MAX_SESSION_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .context("failed to read session file")?;
 
-    if bytes.len() as u64 > MAX_SESSION_BYTES {
+    if bytes.len() as u64 > limit {
         bail!("session file exceeds size limit");
     }
 
@@ -224,6 +334,51 @@ pub(crate) fn load_session(path: &Path, workspace: &Path) -> Result<(SessionFile
 }
 
 impl SessionStore {
+    /// Allocate a distinct archive path; empty conversations are not persisted.
+    pub(crate) fn automatic(workspace: &Path) -> Result<Self> {
+        let mut directory = workspace.to_path_buf();
+        for component in [".agent-cli", "sessions"] {
+            directory.push(component);
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(
+                            &directory,
+                            std::fs::Permissions::from_mode(0o700),
+                        )?;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).context("failed to create session directory"),
+            }
+            if !std::fs::symlink_metadata(&directory)?.is_dir() {
+                bail!("automatic session directory must be a directory, not a symlink");
+            }
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis();
+        let temporary = tempfile::Builder::new()
+            .prefix(&format!("{timestamp}-"))
+            .suffix(".json")
+            .rand_bytes(12)
+            .tempfile_in(directory)
+            .context("failed to allocate automatic session path")?;
+        let path = temporary.path().to_path_buf();
+        temporary.close()?;
+        Self::new(&path, workspace)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
     pub(crate) fn resume(path: &Path, workspace: &Path) -> Result<(Self, AgentSession)> {
         if !std::fs::symlink_metadata(path)
             .context("failed to inspect resume file")?
@@ -326,6 +481,96 @@ mod tests {
     use super::*;
     use crate::agent::ToolCall;
     use serde_json::json;
+
+    #[test]
+    fn session_listing_is_sorted_bounded_and_skips_invalid_archives() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let mut store = SessionStore::automatic(&root).unwrap();
+        let messages = vec![
+            AgentMessage::User("你好\n\u{1b}[31m".repeat(20)),
+            AgentMessage::Assistant("ok".into()),
+        ];
+        store.save(messages.clone(), messages).unwrap();
+        let bytes = std::fs::read(store.path()).unwrap();
+        std::fs::remove_file(store.path()).unwrap();
+        let archives = root.join(".agent-cli/sessions");
+        for index in 1..=22 {
+            std::fs::write(archives.join(format!("{index}-valid.json")), &bytes).unwrap();
+        }
+        std::fs::write(archives.join("99-broken.json"), "not json").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let wrong = json!({"version":1,"workspace":other.path(),"messages":[{"type":"user","data":"secret"},{"type":"assistant","data":"ok"}]});
+        std::fs::write(archives.join("98-other.json"), wrong.to_string()).unwrap();
+        let listing = list_sessions(&root).unwrap();
+        assert_eq!(listing.entries.len(), 20);
+        assert_eq!(listing.entries[0].created_ms, 22);
+        assert_eq!(listing.entries[19].created_ms, 3);
+        assert_eq!(listing.skipped, 2);
+        assert!(listing.incomplete);
+        assert_eq!(listing.entries[0].preview.chars().count(), 81);
+        assert_eq!(
+            std::fs::read(archives.join("22-valid.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn session_listing_missing_directory_does_not_create_it() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(list_sessions(directory.path()).unwrap().entries.is_empty());
+        assert!(!directory.path().join(".agent-cli").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_listing_skips_symlink_archives_and_rejects_linked_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = SessionStore::automatic(root).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            store.path().parent().unwrap().join("99-link.json"),
+        )
+        .unwrap();
+        let listing = list_sessions(root).unwrap();
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.skipped, 1);
+        std::fs::remove_dir_all(root.join(".agent-cli")).unwrap();
+        std::os::unix::fs::symlink(root, root.join(".agent-cli")).unwrap();
+        assert!(list_sessions(root).is_err());
+    }
+
+    #[test]
+    fn automatic_archives_are_distinct_workspace_local_and_lazy() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_root = first.path().canonicalize().unwrap();
+        let second_root = second.path().canonicalize().unwrap();
+        let a = SessionStore::automatic(&first_root).unwrap();
+        let b = SessionStore::automatic(&first_root).unwrap();
+        let c = SessionStore::automatic(&second_root).unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().starts_with(first_root.join(".agent-cli/sessions")));
+        assert!(
+            c.path()
+                .starts_with(second_root.join(".agent-cli/sessions"))
+        );
+        assert!(!a.path().exists());
+        assert!(!b.path().exists());
+        assert!(!c.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_archives_reject_linked_directories() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(".agent-cli")).unwrap();
+        assert!(SessionStore::automatic(workspace.path()).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn compact_format_stores_identical_context_only_once() {

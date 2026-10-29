@@ -316,13 +316,22 @@ fn build_replace_text_tool() -> ChatTool {
         kind: "function".to_string(),
         function: ChatFunctionDefinition {
             name:"replace_text".to_string(),
-            description:"Replace one unique exact occurrence in an existing workspace UTF-8 regular file (maximum 1 MiB before and after). Empty old_text is allowed only when the file is empty, to initialize it with new_text. For nonempty files old_text must be nonempty and uniquely identify the edit, including overlapping occurrences. Preserve other content. Use read_file first. Returns applied, changed and a diff; diff_truncated marks an incomplete diff. Does not create or delete files. Conflicting content, read-only files and invalid paths return errors without writing. This tool is available only with explicit write access.".to_string(),
+            description:"Apply 1–100 ordered exact replacements to one existing workspace UTF-8 regular file. Prefer edits: [{old_text,new_text}, ...]; legacy top-level old_text/new_text is also accepted, but never mix formats. Each edit matches the content AFTER previous edits and must have exactly one occurrence, including overlapping matches. Empty old_text is allowed only when the current content is empty. Read the file first. All edits are prepared in memory and saved once only if all succeed; failures identify the edit and leave the file unchanged. Maximum file size is 1 MiB initially and after every edit; no NUL bytes. Returns applied, changed and a bounded diff with diff_truncated. Does not create or delete files. Requires explicit write access; path, permission and stale-content checks still apply.".to_string(),
             parameters:serde_json::json!({
                 "type":"object", "properties":{
                     "path":{"type":"string","minLength":1},
                     "old_text":{"type":"string"},
-                    "new_text":{"type":"string"}
-                },"required":["path","old_text","new_text"],"additionalProperties":false
+                    "new_text":{"type":"string"},
+                    "edits":{"type":"array","minItems":1,"maxItems":100,"items":{
+                        "type":"object","properties":{
+                            "old_text":{"type":"string"},"new_text":{"type":"string"}
+                        },"required":["old_text","new_text"],"additionalProperties":false
+                    }}
+                },"required":["path"],"additionalProperties":false,
+                "oneOf":[
+                    {"required":["edits"],"not":{"anyOf":[{"required":["old_text"]},{"required":["new_text"]}]}},
+                    {"required":["old_text","new_text"],"not":{"required":["edits"]}}
+                ]
             }),
         },
     }

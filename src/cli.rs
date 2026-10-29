@@ -23,7 +23,7 @@ pub enum Commands {
     Claw {
         config_path: String,
         prompt: Option<String>,
-        /// Keep an in-memory conversation until /exit, EOF or Ctrl+C.
+        /// Interactive conversation with automatic workspace archives; /new starts fresh.
         #[arg(long)]
         interactive: bool,
         /// Save completed interactive turns to a NEW file; parent must exist.

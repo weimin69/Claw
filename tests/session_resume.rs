@@ -25,7 +25,7 @@ fn snapshot(path: &Path, workspace: &Path) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
+async fn trims_old_turn_then_restores_trimmed_context_and_full_history() {
     let server = MockServer::start().await;
     let config = config(&server);
     let directory = tempfile::tempdir().unwrap();
@@ -43,7 +43,7 @@ async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
         &path,
         serde_json::to_vec(&json!({
             "version":2,"workspace":directory.path().canonicalize().unwrap(),
-            "full_history":full,"working_context":working
+            "full_history":full,"working_context":full
         }))
         .unwrap(),
     )
@@ -51,18 +51,22 @@ async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
     Mock::given(method("POST"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = request.body_json().unwrap();
-            assert_eq!(
-                body["messages"],
-                json!([
-                    {"role":"user","content":"recent request"},
-                    {"role":"assistant","content":"recent answer"},
-                    {"role":"user","content":"next\n"}
-                ])
-            );
+            let mut expected = json!([
+                {"role":"user","content":"recent request"},
+                {"role":"assistant","content":"recent answer"},
+                {"role":"user","content":"next\n"}
+            ]);
+            if body["messages"].as_array().unwrap().len() == 5 {
+                expected.as_array_mut().unwrap().extend([
+                    json!({"role":"assistant","content":"continued"}),
+                    json!({"role":"user","content":"again\n"}),
+                ]);
+            }
+            assert_eq!(body["messages"], expected);
             ResponseTemplate::new(200)
                 .set_body_json(json!({"choices":[{"message":{"content":"continued"}}]}))
         })
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Command::cargo_bin("agent-cli-rust")
@@ -78,8 +82,9 @@ async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
         .write_stdin("next\n/exit\n")
         .timeout(Duration::from_secs(10))
         .assert()
-        .success();
-    let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        .success()
+        .stderr(contains("上下文已移除最旧的 1 轮对话"));
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved["version"], 3);
     assert_eq!(
         &saved["full_history"].as_array().unwrap()[..4],
@@ -89,6 +94,28 @@ async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
     assert_eq!(saved["context"], json!({"prefix":[],"recent_start":2}));
     assert!(saved.get("working_context").is_none());
     assert_eq!(saved["full_history"][5]["data"], "continued");
+
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("--interactive")
+        .arg("--workspace")
+        .arg(directory.path())
+        .arg("--resume")
+        .arg(&path)
+        .args(["--max-context-bytes", "512"])
+        .write_stdin("again\n/exit\n")
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success();
+    let restored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(restored["context"], json!({"prefix":[],"recent_start":2}));
+    assert_eq!(restored["full_history"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        &restored["full_history"].as_array().unwrap()[..6],
+        saved["full_history"].as_array().unwrap()
+    );
 }
 
 #[tokio::test]
@@ -339,4 +366,71 @@ fn resume_requires_interactive_and_conflicts_with_new_session_file() {
             .assert()
             .code(2);
     }
+}
+
+#[tokio::test]
+async fn v2_restores_distinct_context_and_preserves_full_history_on_update() {
+    let server = MockServer::start().await;
+    let config = config(&server);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("v2.json");
+    let working = json!([
+        {"type":"user","data":"recent request"},
+        {"type":"assistant","data":"recent answer"}
+    ]);
+    let full = json!([
+        {"type":"user","data":"original details ".repeat(256)},
+        {"type":"assistant","data":"old answer"},
+        working[0], working[1]
+    ]);
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "version":2,"workspace":directory.path().canonicalize().unwrap(),
+            "full_history":full,"working_context":working
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    Mock::given(method("POST"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: Value = request.body_json().unwrap();
+            assert_eq!(
+                body["messages"],
+                json!([
+                    {"role":"user","content":"recent request"},
+                    {"role":"assistant","content":"recent answer"},
+                    {"role":"user","content":"next\n"}
+                ])
+            );
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"choices":[{"message":{"content":"continued"}}]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("--interactive")
+        .arg("--workspace")
+        .arg(directory.path())
+        .arg("--resume")
+        .arg(&path)
+        .args(["--max-context-bytes", "512"])
+        .write_stdin("next\n/exit\n")
+        .timeout(Duration::from_secs(10))
+        .assert()
+        .success();
+    let saved: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(saved["version"], 3);
+    assert_eq!(
+        &saved["full_history"].as_array().unwrap()[..4],
+        full.as_array().unwrap()
+    );
+    assert_eq!(saved["full_history"].as_array().unwrap().len(), 6);
+    assert_eq!(saved["context"], json!({"prefix":[],"recent_start":2}));
+    assert!(saved.get("working_context").is_none());
+    assert_eq!(saved["full_history"][5]["data"], "continued");
 }

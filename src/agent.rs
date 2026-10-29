@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
+    ContextTrimmed {
+        turns: usize,
+    },
     ModelStarted {
         iteration: usize,
     },
@@ -197,6 +200,15 @@ impl Default for AgentSession {
 }
 
 impl AgentSession {
+    pub(crate) fn context_limit(&self) -> usize {
+        self.max_context_bytes
+    }
+    pub(crate) fn new_conversation(&self) -> Self {
+        Self {
+            max_context_bytes: self.max_context_bytes,
+            ..Self::default()
+        }
+    }
     pub(crate) fn from_parts(
         full_history: Vec<AgentMessage>,
         working_context: Vec<AgentMessage>,
@@ -251,7 +263,7 @@ impl AgentSession {
         max_iterations: Option<usize>,
         max_tool_calls: Option<usize>,
         tool_executor: &mut T,
-        on_event: impl FnMut(AgentEvent),
+        mut on_event: impl FnMut(AgentEvent),
     ) -> Result<AgentRunResult> {
         if self.closed {
             bail!("agent session is closed after an interrupted or failed turn");
@@ -262,15 +274,28 @@ impl AgentSession {
         let previous_len = messages.len();
         messages.append(&mut state.messages);
         state.messages = messages;
-        if let Err(error) = check_context_size(&state.messages, self.max_context_bytes) {
-            state.messages.truncate(previous_len);
-            self.working_context = had_context.then_some(state.messages);
-            return Err(error);
-        }
-        self.closed = true;
+        let start = match context_start(&state.messages, self.max_context_bytes) {
+            std::result::Result::Ok(start) => start,
+            Err(error) => {
+                state.messages.truncate(previous_len);
+                self.working_context = had_context.then_some(state.messages);
+                return Err(error);
+            }
+        };
         // The input is accepted only after preflight succeeds. Do not append
         // rejected inputs, nor old working messages (which may later be summaries).
         self.full_history.push(state.messages[previous_len].clone());
+        let removed_turns = state.messages[..start]
+            .iter()
+            .filter(|message| matches!(message, AgentMessage::Assistant(_)))
+            .count();
+        state.messages.drain(..start);
+        self.closed = true;
+        if removed_turns > 0 {
+            on_event(AgentEvent::ContextTrimmed {
+                turns: removed_turns,
+            });
+        }
         let result = run_turn_loop(
             model,
             &mut state,
@@ -453,11 +478,164 @@ fn check_context_size(messages: &[AgentMessage], max_context_bytes: usize) -> Re
     Ok(())
 }
 
+fn first_turn_end(messages: &[AgentMessage]) -> Option<usize> {
+    for (index, message) in messages.iter().enumerate() {
+        if matches!(message, AgentMessage::Assistant(_)) {
+            return Some(index + 1);
+        }
+    }
+    None
+}
+
+/// Input consists of completed old turns followed by the new user message.
+/// Return a turn boundary without modifying the original messages.
+fn context_start(messages: &[AgentMessage], max_context_bytes: usize) -> Result<usize> {
+    let mut start = 0;
+    loop {
+        match check_context_size(&messages[start..], max_context_bytes) {
+            std::result::Result::Ok(()) => return Ok(start),
+            Err(error) if error.is::<ContextLimitExceeded>() => {
+                match first_turn_end(&messages[start..]) {
+                    Some(end) => start += end,
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::BuiltinToolExecutor;
     use std::collections::VecDeque;
+
+    #[test]
+    fn new_conversation_preserves_budget_but_clears_histories_and_closed_state() {
+        let mut old = AgentSession::from_history(vec![
+            AgentMessage::User("old".into()),
+            AgentMessage::Assistant("answer".into()),
+        ])
+        .unwrap();
+        old.set_context_limit(128).unwrap();
+        old.closed = true;
+        let new = old.new_conversation();
+        assert_eq!(new.max_context_bytes, 128);
+        assert!(new.full_history.is_empty());
+        assert!(new.working_context.is_none());
+        assert!(new.can_continue());
+        assert_eq!(old.full_history.len(), 2);
+    }
+
+    #[test]
+    fn context_start_keeps_history_at_exact_budget() {
+        let messages = vec![
+            AgentMessage::User("old question".into()),
+            AgentMessage::Assistant("old answer".into()),
+            AgentMessage::User("new question".into()),
+        ];
+        let budget = serde_json::to_vec(&messages).unwrap().len();
+
+        assert_eq!(context_start(&messages, budget).unwrap(), 0);
+    }
+
+    #[test]
+    fn context_start_removes_only_as_many_old_turns_as_needed() {
+        let messages = vec![
+            AgentMessage::User("first question".into()),
+            AgentMessage::Assistant("first answer".into()),
+            AgentMessage::User("second question".into()),
+            AgentMessage::Assistant("second answer".into()),
+            AgentMessage::User("new question".into()),
+        ];
+        let original = messages.clone();
+        for expected_start in [2, 4] {
+            let budget = serde_json::to_vec(&messages[expected_start..])
+                .unwrap()
+                .len();
+            assert_eq!(context_start(&messages, budget).unwrap(), expected_start);
+        }
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn context_start_removes_tool_turn_as_a_whole() {
+        let messages = vec![
+            AgentMessage::User("read a file".into()),
+            AgentMessage::AssistantToolCalls(vec![ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                input: r#"{"path":"src/main.rs"}"#.into(),
+            }]),
+            AgentMessage::ToolResult {
+                tool_call_id: "read-1".into(),
+                name: "read_file".into(),
+                output: "file contents".into(),
+                is_error: false,
+            },
+            AgentMessage::Assistant("done".into()),
+            AgentMessage::User("next question".into()),
+        ];
+        let budget = serde_json::to_vec(&messages[4..]).unwrap().len();
+
+        assert_eq!(context_start(&messages, budget).unwrap(), 4);
+    }
+
+    #[test]
+    fn context_start_rejects_oversized_new_input_without_changing_history() {
+        let messages = vec![
+            AgentMessage::User("old question".into()),
+            AgentMessage::Assistant("old answer".into()),
+            AgentMessage::User("new question".repeat(100)),
+        ];
+        let original = messages.clone();
+        let actual = serde_json::to_vec(&messages[2..]).unwrap().len();
+        let error = context_start(&messages, actual - 1).unwrap_err();
+        let error = error.downcast_ref::<ContextLimitExceeded>().unwrap();
+
+        assert_eq!(error.actual, actual);
+        assert_eq!(error.limit, actual - 1);
+        assert_eq!(messages, original);
+    }
+
+    #[test]
+    fn first_turn_end_returns_none_for_empty_history() {
+        assert_eq!(first_turn_end(&[]), None);
+    }
+
+    #[test]
+    fn first_turn_end_returns_first_completed_turn_boundary() {
+        let messages = vec![
+            AgentMessage::User("first question".into()),
+            AgentMessage::Assistant("first answer".into()),
+            AgentMessage::User("second question".into()),
+            AgentMessage::Assistant("second answer".into()),
+        ];
+
+        assert_eq!(first_turn_end(&messages), Some(2));
+    }
+
+    #[test]
+    fn first_turn_end_keeps_tool_calls_and_results_in_same_turn() {
+        let messages = vec![
+            AgentMessage::User("read the file".into()),
+            AgentMessage::AssistantToolCalls(vec![ToolCall {
+                id: "read-1".into(),
+                name: "read_file".into(),
+                input: r#"{"path":"src/main.rs"}"#.into(),
+            }]),
+            AgentMessage::ToolResult {
+                tool_call_id: "read-1".into(),
+                name: "read_file".into(),
+                output: "fn main() {}".into(),
+                is_error: false,
+            },
+            AgentMessage::Assistant("the file contains an empty main function".into()),
+        ];
+
+        assert_eq!(first_turn_end(&messages), Some(4));
+    }
 
     #[tokio::test]
     async fn full_history_and_working_context_record_each_new_message_once() {
@@ -501,9 +679,7 @@ mod tests {
         ];
         let mut session = AgentSession::from_history(original.clone()).unwrap();
         assert_eq!(session.working_context.as_deref().unwrap(), original);
-        // Simulate a future context-selection step; no automatic pruning or
-        // summarization is exposed to users in this implementation stage.
-        session.working_context = Some(original[2..].to_vec());
+        // Preflight must remove the oversized oldest turn automatically.
         session.set_context_limit(512).unwrap();
         assert!(check_context_size(&original, 512).is_err());
         let mut model = FakeModel::new(vec![ModelDecision::FinalAnswer("continued".into())]);

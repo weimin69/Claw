@@ -72,7 +72,11 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
                 if kind.is_symlink() {
                     continue;
                 }
-                if kind.is_dir() && (entry.file_name() == ".git" || entry.file_name() == "target") {
+                if kind.is_dir()
+                    && (entry.file_name() == ".git"
+                        || entry.file_name() == "target"
+                        || entry.file_name() == ".agent-cli")
+                {
                     continue;
                 }
                 if kind.is_file() {
@@ -225,7 +229,7 @@ mod tests {
     #[test]
     fn skips_generated_directories_and_unsupported_files() {
         let directory = tempfile::tempdir().unwrap();
-        for name in [".git", "target"] {
+        for name in [".git", "target", ".agent-cli"] {
             fs::create_dir(directory.path().join(name)).unwrap();
             fs::write(directory.path().join(name).join("file"), "needle").unwrap();
         }
