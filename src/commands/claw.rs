@@ -1,8 +1,11 @@
-use crate::agent::{AgentEvent, AgentRunResult, AgentSession, ContextLimitExceeded, run_agent};
+use crate::agent::{
+    AgentEvent, AgentRunResult, AgentSession, ContextLimitExceeded, ToolEffect, run_agent,
+};
 use crate::openai_compatible::OpenAiCompatibleAgentModel;
 use crate::session::{SessionStore, list_sessions};
 use crate::tools::BuiltinToolExecutor;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::io::{Read, Write, stdin};
 
 #[derive(Debug)]
@@ -366,6 +369,9 @@ fn print_event(event: AgentEvent) {
 fn print_result(result: &AgentRunResult) {
     println!("{}", result.answer);
     println!("\n执行统计：");
+    for line in format_effects(&result.effects) {
+        println!("{line}");
+    }
     println!("工具调用：");
     if result.tool_calls.is_empty() {
         println!("  无");
@@ -381,6 +387,75 @@ fn print_result(result: &AgentRunResult) {
     println!("Loop 次数：{}", result.iterations);
 }
 
+/// Aggregate repeated facts for display only. Runtime order and duplicates are
+/// intentionally discarded here; the raw vector is meant for future tracing.
+fn format_effects(effects: &[ToolEffect]) -> Vec<String> {
+    let mut files = BTreeMap::<&str, (bool, usize)>::new();
+    let mut commands = Vec::new();
+    for effect in effects {
+        match effect {
+            ToolEffect::CreatedFile { path } => files.entry(path).or_default().0 = true,
+            ToolEffect::ModifiedFile { path, edits } => {
+                let entry = files.entry(path).or_default();
+                entry.1 = entry.1.saturating_add(*edits);
+            }
+            ToolEffect::CommandFinished {
+                program,
+                args,
+                exit_code,
+                timed_out,
+            } => commands.push(format_command(program, args, *exit_code, *timed_out)),
+        }
+    }
+
+    let mut lines = vec!["变更文件：".to_string()];
+    if files.is_empty() {
+        lines.push("  无".to_string());
+    }
+    for (path, (created, edits)) in files {
+        let path = path.escape_debug();
+        lines.push(match (created, edits) {
+            (true, 0) => format!("  {path}（新建）"),
+            (true, _) => format!("  {path}（新建，后续修改 {edits} 处）"),
+            (false, _) => format!("  {path}（修改 {edits} 处）"),
+        });
+    }
+    lines.push("执行命令：".to_string());
+    if commands.is_empty() {
+        lines.push("  无".to_string());
+    }
+    lines.extend(commands.into_iter().map(|command| format!("  {command}")));
+    lines
+}
+
+const MAX_COMMAND_CHARS: usize = 160;
+
+fn format_command(
+    program: &str,
+    args: &[String],
+    exit_code: Option<i32>,
+    timed_out: bool,
+) -> String {
+    let mut line = program.escape_debug().to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(&arg.escape_debug().to_string());
+    }
+    if line.chars().count() > MAX_COMMAND_CHARS {
+        line = line.chars().take(MAX_COMMAND_CHARS).collect();
+        line.push('…');
+    }
+    let status = if timed_out {
+        "超时".to_string()
+    } else {
+        match exit_code {
+            Some(code) => format!("退出码 {code}"),
+            None => "被信号终止".to_string(),
+        }
+    };
+    format!("{line} → {status}")
+}
+
 fn read_prompt_from_stdin() -> Result<String> {
     let mut content = String::new();
     stdin()
@@ -388,4 +463,88 @@ fn read_prompt_from_stdin() -> Result<String> {
         .context("failed to read prompt from stdin")?;
 
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lines(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_effects_still_print_both_headers() {
+        assert_eq!(
+            format_effects(&[]),
+            lines(&["变更文件：", "  无", "执行命令：", "  无"])
+        );
+    }
+
+    #[test]
+    fn effects_aggregate_paths_and_keep_command_status() {
+        let effects = vec![
+            ToolEffect::ModifiedFile {
+                path: "src/a.rs".into(),
+                edits: 2,
+            },
+            ToolEffect::ModifiedFile {
+                path: "src/a.rs".into(),
+                edits: 1,
+            },
+            ToolEffect::CreatedFile {
+                path: "src/b.rs".into(),
+            },
+            ToolEffect::CreatedFile {
+                path: "src/c.rs".into(),
+            },
+            ToolEffect::ModifiedFile {
+                path: "src/c.rs".into(),
+                edits: 1,
+            },
+            ToolEffect::CommandFinished {
+                program: "cargo".into(),
+                args: vec!["test".into()],
+                exit_code: Some(101),
+                timed_out: false,
+            },
+            ToolEffect::CommandFinished {
+                program: "sh".into(),
+                args: vec!["-c".into(), "sleep 5\nrm".into()],
+                exit_code: None,
+                timed_out: true,
+            },
+            ToolEffect::CommandFinished {
+                program: "kill".into(),
+                args: Vec::new(),
+                exit_code: None,
+                timed_out: false,
+            },
+        ];
+        assert_eq!(
+            format_effects(&effects),
+            lines(&[
+                "变更文件：",
+                "  src/a.rs（修改 3 处）",
+                "  src/b.rs（新建）",
+                "  src/c.rs（新建，后续修改 1 处）",
+                "执行命令：",
+                "  cargo test → 退出码 101",
+                "  sh -c sleep 5\\nrm → 超时",
+                "  kill → 被信号终止",
+            ])
+        );
+    }
+
+    #[test]
+    fn long_commands_are_bounded_without_losing_status() {
+        let long = "a".repeat(MAX_COMMAND_CHARS + 20);
+        let line = format_command("prog", &[long], Some(1), false);
+        assert!(line.contains('…'));
+        assert!(line.ends_with("→ 退出码 1"));
+        assert_eq!(
+            line.chars().count(),
+            MAX_COMMAND_CHARS + 1 + " → 退出码 1".chars().count()
+        );
+    }
 }

@@ -26,11 +26,33 @@ pub(crate) enum AgentEvent {
     },
 }
 
+/// A fact reported by a tool about something that actually happened.
+/// Effects are never sent to the model and never persisted.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) enum ToolEffect {
+    CreatedFile {
+        path: String,
+    },
+    ModifiedFile {
+        path: String,
+        edits: usize,
+    },
+    CommandFinished {
+        program: String,
+        args: Vec<String>,
+        exit_code: Option<i32>,
+        timed_out: bool,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AgentRunResult {
     pub(crate) answer: String,
     pub(crate) iterations: usize,
     pub(crate) tool_calls: BTreeMap<String, usize>,
+    /// Ordered, possibly repeated facts from this turn's successful writes and
+    /// executed commands. Presentation-level aggregation happens in the CLI.
+    pub(crate) effects: Vec<ToolEffect>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +86,7 @@ pub(crate) enum AgentMessage {
 pub(crate) struct ToolOutput {
     pub(crate) content: String,
     pub(crate) is_error: bool,
+    pub(crate) effects: Vec<ToolEffect>,
 }
 
 impl ToolOutput {
@@ -71,6 +94,7 @@ impl ToolOutput {
         Self {
             content,
             is_error: false,
+            effects: Vec::new(),
         }
     }
 
@@ -78,7 +102,13 @@ impl ToolOutput {
         Self {
             content,
             is_error: true,
+            effects: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_effects(mut self, effects: Vec<ToolEffect>) -> Self {
+        self.effects = effects;
+        self
     }
 }
 
@@ -391,6 +421,7 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
     full_history: &mut Vec<AgentMessage>,
 ) -> Result<AgentRunResult> {
     let mut tool_counts = BTreeMap::<String, usize>::new();
+    let mut effects = Vec::<ToolEffect>::new();
     loop {
         state.begin_iteration()?;
 
@@ -414,6 +445,7 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
                     answer,
                     iterations: state.iteration,
                     tool_calls: tool_counts,
+                    effects,
                 });
             }
             ModelDecision::ToolCalls(tool_calls) => {
@@ -446,6 +478,9 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
                     });
                     let tool_output = tool_output?;
 
+                    // Report what happened, not whether the tool "succeeded": a
+                    // failing test run still executed and must stay visible.
+                    effects.extend(tool_output.effects);
                     state.record_message(
                         AgentMessage::ToolResult {
                             tool_call_id: tool_call.id,
@@ -1102,6 +1137,7 @@ mod tests {
                 output: ToolOutput {
                     content: "private output".into(),
                     is_error,
+                    effects: Vec::new(),
                 },
                 calls: Vec::new(),
             };
@@ -1314,6 +1350,53 @@ mod tests {
         assert_eq!(
             result.tool_calls,
             BTreeMap::from([("add".to_string(), 2), ("unknown".to_string(), 1),])
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_effects_are_ordered_and_never_sent_to_the_model() {
+        let effect = || ToolEffect::ModifiedFile {
+            path: "a.rs".into(),
+            edits: 1,
+        };
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "replace_text".to_string(),
+            input: r#"{"path":"a.rs","old_text":"a","new_text":"b"}"#.to_string(),
+        };
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![call("1")]),
+            ModelDecision::ToolCalls(vec![call("2")]),
+            ModelDecision::FinalAnswer("done".to_string()),
+        ]);
+        let mut tool = FakeToolExecutor {
+            output: ToolOutput::success("ok".to_string()).with_effects(vec![effect()]),
+            calls: Vec::new(),
+        };
+
+        let result = run_agent(
+            &mut model,
+            "go".to_string(),
+            None,
+            None,
+            &mut tool,
+            |_| {},
+            DEFAULT_MAX_CONTEXT_BYTES,
+        )
+        .await
+        .unwrap();
+
+        // Duplicates and order are preserved; aggregation is a display concern.
+        assert_eq!(result.effects, vec![effect(), effect()]);
+        // Tool results sent to the model carry content only, not effects.
+        assert_eq!(
+            model.received_messages[1][2],
+            AgentMessage::ToolResult {
+                tool_call_id: "1".into(),
+                name: "replace_text".into(),
+                output: "ok".into(),
+                is_error: false,
+            }
         );
     }
 

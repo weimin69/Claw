@@ -1,4 +1,4 @@
-use crate::agent::{ToolExecutor, ToolOutput};
+use crate::agent::{ToolEffect, ToolExecutor, ToolOutput};
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,23 @@ mod command;
 mod create;
 mod edit;
 mod search;
+
+/// A successful tool payload: model-visible content plus facts that must not be
+/// sent to the model. Read-only tools keep returning `String` and convert.
+#[derive(Debug)]
+pub(super) struct ToolResult {
+    pub(super) content: String,
+    pub(super) effects: Vec<ToolEffect>,
+}
+
+impl From<String> for ToolResult {
+    fn from(content: String) -> Self {
+        Self {
+            content,
+            effects: Vec::new(),
+        }
+    }
+}
 pub(crate) struct BuiltinToolExecutor {
     workspace: Workspace,
     allow_write: bool,
@@ -36,8 +53,8 @@ impl BuiltinToolExecutor {
 
 impl ToolExecutor for BuiltinToolExecutor {
     async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
-        let result = match name {
-            "add" => execute_add(input),
+        let result: Result<ToolResult> = match name {
+            "add" => execute_add(input).map(ToolResult::from),
             "run_command" => {
                 if !self.allow_exec {
                     return Ok(ToolOutput::error(
@@ -80,6 +97,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 tokio::task::spawn_blocking(move || execute_list_files(&workspace, &input))
                     .await
                     .context("list_files worker failed")?
+                    .map(ToolResult::from)
             }
             "read_file" => {
                 let workspace = self.workspace.clone();
@@ -87,6 +105,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                 tokio::task::spawn_blocking(move || execute_read_file(&workspace, &input))
                     .await
                     .context("read_file worker failed")?
+                    .map(ToolResult::from)
             }
             "search_code" => {
                 let workspace = self.workspace.clone();
@@ -94,12 +113,17 @@ impl ToolExecutor for BuiltinToolExecutor {
                 tokio::task::spawn_blocking(move || search::execute(&workspace, &input))
                     .await
                     .context("search_code worker failed")?
+                    .map(ToolResult::from)
             }
             _ => return Ok(ToolOutput::error(format!("unknown tool `{name}`"))),
         };
 
         Ok(match result {
-            Ok(output) => ToolOutput::success(output),
+            Ok(output) => ToolOutput {
+                content: output.content,
+                is_error: false,
+                effects: output.effects,
+            },
             Err(error) => ToolOutput::error(error.to_string()),
         })
     }

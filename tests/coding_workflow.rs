@@ -88,7 +88,7 @@ async fn claw_repairs_failing_test_without_changing_assertions() {
         .args(["--allow-write", "--allow-exec", "--max-iterations", "5", "--max-tool-calls", "4"])
         .timeout(Duration::from_secs(150))
         .assert().success()
-        .stdout(contains("Implementation repaired; tests pass.\n\n执行统计：\n工具调用：\n  read_file: 1 次\n  replace_text: 1 次\n  run_command: 2 次\n工具调用总数：4\nLoop 次数：5\n"));
+        .stdout(contains("Implementation repaired; tests pass.\n\n执行统计：\n变更文件：\n  src/lib.rs（修改 1 处）\n执行命令：\n").and(contains("→ 退出码 0\n工具调用：\n  read_file: 1 次\n  replace_text: 1 次\n  run_command: 2 次\n工具调用总数：4\nLoop 次数：5\n")));
 
     // Inspect actual request history, not the scripted model's success statement.
     let requests = server.received_requests().await.unwrap();
@@ -267,6 +267,8 @@ async fn claw_repairs_two_source_files_with_ordered_batch_edits() {
         .assert()
         .success()
         .stdout(contains("Both source files repaired; tests pass.").and(contains(
+            "变更文件：\n  src/lib.rs（修改 1 处）\n  src/math.rs（修改 2 处）\n执行命令：\n"
+        )).and(contains(
             "  read_file: 2 次\n  replace_text: 2 次\n  run_command: 2 次\n工具调用总数：6\nLoop 次数：7"
         )));
 

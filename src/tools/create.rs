@@ -1,4 +1,5 @@
-use super::MAX_READ_FILE_BYTES;
+use super::{MAX_READ_FILE_BYTES, ToolResult};
+use crate::agent::ToolEffect;
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -11,7 +12,7 @@ struct CreateFileInput {
     content: String,
 }
 
-pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
+pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<ToolResult> {
     let input: CreateFileInput =
         serde_json::from_str(input).context("invalid create_file tool input")?;
     if input.path.trim().is_empty() {
@@ -51,7 +52,12 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
         .persist_noclobber(&target)
         .map_err(|error| error.error)
         .context("failed to create file without overwriting an existing target")?;
-    Ok(result)
+    Ok(ToolResult {
+        content: result,
+        effects: vec![ToolEffect::CreatedFile {
+            path: relative.to_string(),
+        }],
+    })
 }
 
 #[cfg(test)]
@@ -72,7 +78,13 @@ mod tests {
         let content = "你好\r\n";
         let result = execute(&workspace, &request("src/new.rs", content)).unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+            result.effects,
+            vec![ToolEffect::CreatedFile {
+                path: "src/new.rs".into()
+            }]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result.content).unwrap(),
             serde_json::json!({
                 "path":"src/new.rs","created":true,"bytes_written":content.len()
             })

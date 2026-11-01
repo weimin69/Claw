@@ -1,4 +1,5 @@
-use crate::{agent::ToolOutput, workspace::Workspace};
+use crate::agent::{ToolEffect, ToolOutput};
+use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::{
@@ -169,20 +170,29 @@ pub(super) async fn execute(workspace: &Workspace, input: &str) -> Result<ToolOu
         }
     };
     let success = !timed_out && status.is_some_and(|status| status.success());
+    let exit_code = status.and_then(|status| status.code());
     let stdout = out.text();
     let stderr = err.text();
     let result = serde_json::json!({
-        "success":success,"exit_code":status.and_then(|status|status.code()),
+        "success":success,"exit_code":exit_code,
         "timed_out":timed_out,"stdout":stdout,"stderr":stderr,
         "stdout_truncated":out.truncated,"stderr_truncated":err.truncated,
         "duration_ms":started.elapsed().as_millis()
     })
     .to_string();
+    // The command ran even if it exited nonzero or timed out; report it.
+    let effects = vec![ToolEffect::CommandFinished {
+        program: input.program.clone(),
+        args: input.args.clone(),
+        exit_code,
+        timed_out,
+    }];
     Ok(if success {
         ToolOutput::success(result)
     } else {
         ToolOutput::error(result)
-    })
+    }
+    .with_effects(effects))
 }
 
 #[cfg(all(test, unix))]
@@ -212,6 +222,15 @@ mod tests {
         .unwrap();
         assert!(!result.is_error);
         assert_eq!(value(&result)["stdout"], "a && echo injected > file");
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::CommandFinished {
+                program: "/usr/bin/printf".into(),
+                args: vec!["%s".into(), "a && echo injected > file".into()],
+                exit_code: Some(0),
+                timed_out: false,
+            }]
+        );
         assert!(!directory.path().join("file").exists());
         let result = execute(
             &workspace,
@@ -250,6 +269,15 @@ mod tests {
         assert_eq!(value(&result)["exit_code"], 7);
         assert_eq!(value(&result)["stdout"], "out");
         assert_eq!(value(&result)["stderr"], "err");
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::CommandFinished {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf out; printf err >&2; exit 7".into()],
+                exit_code: Some(7),
+                timed_out: false,
+            }]
+        );
         let result = execute(&workspace,&request("/bin/sh",&["-c","i=0; while [ $i -lt 5000 ]; do printf 0123456789; printf 0123456789 >&2; i=$((i+1)); done"])).await.unwrap();
         assert!(!result.is_error);
         let output = value(&result);
@@ -314,6 +342,18 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(value(&result)["timed_out"], true);
         assert_eq!(value(&result)["exit_code"], serde_json::Value::Null);
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::CommandFinished {
+                program: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "(sleep 2; printf orphan > late) & exit 0".into()
+                ],
+                exit_code: None,
+                timed_out: true,
+            }]
+        );
         tokio::time::sleep(Duration::from_millis(1300)).await;
         assert!(!directory.path().join("late").exists());
     }

@@ -959,7 +959,7 @@ temperature = 0.2
         .arg(config_file.path().parent().unwrap())
         .assert()
         .success()
-        .stdout("Hello from Claw\n\n执行统计：\n工具调用：\n  无\n工具调用总数：0\nLoop 次数：1\n")
+        .stdout("Hello from Claw\n\n执行统计：\n变更文件：\n  无\n执行命令：\n  无\n工具调用：\n  无\n工具调用总数：0\nLoop 次数：1\n")
         .stderr(contains("等待模型响应").and(contains("模型响应完成")));
 }
 
@@ -1080,6 +1080,59 @@ temperature = 0.2
         .arg("add 2 and 3")
         .assert()
         .success()
-        .stdout("The result is 5\n\n执行统计：\n工具调用：\n  add: 1 次\n工具调用总数：1\nLoop 次数：2\n")
+        .stdout("The result is 5\n\n执行统计：\n变更文件：\n  无\n执行命令：\n  无\n工具调用：\n  add: 1 次\n工具调用总数：1\nLoop 次数：2\n")
         .stderr(contains("等待模型响应").and(contains("模型响应完成")));
+}
+
+#[tokio::test]
+async fn claw_summary_lists_created_file_and_absent_commands() {
+    let workspace = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let count = body["messages"].as_array().unwrap().len();
+            match count {
+                1 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": null, "tool_calls": [{
+                        "id": "create-notes", "type": "function",
+                        "function": {
+                            "name": "create_file",
+                            "arguments": serde_json::json!({
+                                "path": "notes.txt", "content": "hello"
+                            }).to_string()
+                        }
+                    }]}}]
+                })),
+                3 => ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "Created notes.txt."}}]
+                })),
+                _ => ResponseTemplate::new(500),
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let config = write_temp_config(&format!(
+        "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+        server.uri()
+    ));
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("create a notes file")
+        .arg("--workspace")
+        .arg(workspace.path())
+        .arg("--allow-write")
+        .assert()
+        .success()
+        .stdout("Created notes.txt.\n\n执行统计：\n变更文件：\n  notes.txt（新建）\n执行命令：\n  无\n工具调用：\n  create_file: 1 次\n工具调用总数：1\nLoop 次数：2\n");
+
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+        "hello"
+    );
 }

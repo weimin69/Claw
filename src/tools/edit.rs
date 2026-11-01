@@ -1,4 +1,5 @@
-use super::MAX_READ_FILE_BYTES;
+use super::{MAX_READ_FILE_BYTES, ToolResult};
+use crate::agent::ToolEffect;
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -74,9 +75,10 @@ struct TextEdit {
     new_text: String,
 }
 
-pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
+pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<ToolResult> {
     let input: ReplaceTextInput =
         serde_json::from_str(input).context("invalid replace_text tool input")?;
+    let edits = input.edits.len();
     let plan = prepare_edit(workspace, input)?;
     let path = plan
         .path
@@ -105,7 +107,13 @@ pub(super) fn execute(workspace: &Workspace, input: &str) -> Result<String> {
         diff = &diff[..end];
     };
     apply_edit(workspace, &plan)?;
-    Ok(result)
+    Ok(ToolResult {
+        content: result,
+        effects: vec![ToolEffect::ModifiedFile {
+            path: path.to_string(),
+            edits,
+        }],
+    })
 }
 
 /// Prepare a proposal only; never writes to disk or sends content to the model.
@@ -332,7 +340,14 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "start\r\nkeep\r\n结束\r\n"
         );
-        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            result.effects,
+            vec![ToolEffect::ModifiedFile {
+                path: "file".into(),
+                edits: 2
+            }]
+        );
+        let result: serde_json::Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(result["applied"], true);
         let diff = result["diff"].as_str().unwrap();
         for line in ["-first", "+start", "-最后", "+结束"] {
@@ -431,8 +446,8 @@ mod tests {
             &serde_json::json!({"path":"file","old_text":old,"new_text":new}).to_string(),
         )
         .unwrap();
-        assert!(output.len() <= 32 * 1024);
-        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert!(output.content.len() <= 32 * 1024);
+        let value: serde_json::Value = serde_json::from_str(&output.content).unwrap();
         assert_eq!(value["applied"], true);
         assert_eq!(value["diff_truncated"], true);
         assert_eq!(fs::read_to_string(path).unwrap(), new);
