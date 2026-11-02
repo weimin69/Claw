@@ -1,8 +1,9 @@
 //! Client behavior for the OpenAI-compatible Chat Completions protocol.
 
 use crate::agent::{AgentMessage, AgentModel, ModelDecision, ToolCall};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Serialize)]
 struct ChatRequest {
@@ -81,10 +82,251 @@ struct AssistantMessage {
     tool_calls: Vec<ChatToolCall>,
 }
 
-pub(crate) struct OpenAiCompatibleAgentModel {
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_MAX_ATTEMPTS: usize = 3;
+const DEFAULT_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const DEFAULT_MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Retry policy for model requests. Delays are deterministic so behavior is
+/// reproducible; a provider `Retry-After` header overrides the backoff.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryPolicy {
+    max_attempts: usize,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            initial_delay: DEFAULT_INITIAL_RETRY_DELAY,
+            max_delay: DEFAULT_MAX_RETRY_DELAY,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Delay before the next attempt after `failed_attempt`: 1s, 2s, 4s ...,
+    /// capped by `max_delay`. A bounded `Retry-After` replaces the backoff.
+    fn delay_for(&self, failed_attempt: usize, retry_after: Option<Duration>) -> Duration {
+        if let Some(after) = retry_after {
+            return after.min(self.max_delay);
+        }
+        let exponent = failed_attempt.saturating_sub(1).min(16) as u32;
+        self.initial_delay
+            .saturating_mul(1u32 << exponent)
+            .min(self.max_delay)
+    }
+
+    #[cfg(test)]
+    fn immediate(max_attempts: usize) -> Self {
+        Self {
+            max_attempts,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+        }
+    }
+}
+
+/// A retry that is about to happen. `attempt` is the attempt that failed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RetryNotice {
+    pub(crate) attempt: usize,
+    pub(crate) max_attempts: usize,
+    pub(crate) delay: Duration,
+    pub(crate) reason: String,
+}
+
+impl RetryNotice {
+    pub(crate) fn next_attempt(&self) -> usize {
+        self.attempt + 1
+    }
+}
+
+type RetryObserver = Box<dyn FnMut(&RetryNotice) + Send>;
+
+enum FailureSource {
+    Status(reqwest::StatusCode),
+    Request(reqwest::Error),
+    Body(reqwest::Error),
+}
+
+impl FailureSource {
+    fn describe(&self) -> String {
+        match self {
+            Self::Status(status) => format!("status {status}"),
+            Self::Request(error) | Self::Body(error) => shorten(&error.to_string(), 160),
+        }
+    }
+}
+
+struct AttemptFailure {
+    retryable: bool,
+    retry_after: Option<Duration>,
+    source: FailureSource,
+}
+
+impl AttemptFailure {
+    fn reason(&self) -> String {
+        self.source.describe()
+    }
+
+    fn into_error(self, label: &str, attempts: usize) -> anyhow::Error {
+        let suffix = if attempts > 1 {
+            format!(" after {attempts} attempts")
+        } else {
+            String::new()
+        };
+        match self.source {
+            FailureSource::Status(status) => {
+                anyhow!("{label} request failed with status {status}{suffix}")
+            }
+            FailureSource::Request(error) => {
+                anyhow::Error::new(error).context(format!("failed to send {label} request{suffix}"))
+            }
+            FailureSource::Body(error) => anyhow::Error::new(error)
+                .context(format!("failed to read {label} response body{suffix}")),
+        }
+    }
+}
+
+struct ChatEndpoint {
     client: reqwest::Client,
-    base_url: String,
+    url: String,
     api_key: String,
+    retry: RetryPolicy,
+    on_retry: Option<RetryObserver>,
+}
+
+impl ChatEndpoint {
+    fn new(base_url: &str, api_key: String, retry: RetryPolicy) -> Result<Self> {
+        Ok(Self {
+            client: build_http_client(DEFAULT_HTTP_TIMEOUT)?,
+            url: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            api_key,
+            retry,
+            on_retry: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
+        self.client = build_http_client(timeout)?;
+        Ok(self)
+    }
+
+    /// Send one chat-completions request, retrying only transient failures.
+    /// Authentication, request errors and invalid responses fail immediately.
+    async fn complete(&mut self, request: &ChatRequest, label: &str) -> Result<String> {
+        let mut attempt = 1;
+        loop {
+            let failure = match self.send_once(request).await {
+                Ok(text) => return Ok(text),
+                Err(failure) => failure,
+            };
+
+            if !failure.retryable || attempt >= self.retry.max_attempts {
+                return Err(failure.into_error(label, attempt));
+            }
+
+            let delay = self.retry.delay_for(attempt, failure.retry_after);
+            if let Some(observer) = self.on_retry.as_mut() {
+                observer(&RetryNotice {
+                    attempt,
+                    max_attempts: self.retry.max_attempts,
+                    delay,
+                    reason: failure.reason(),
+                });
+            }
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            attempt += 1;
+        }
+    }
+
+    async fn send_once(
+        &self,
+        request: &ChatRequest,
+    ) -> std::result::Result<String, AttemptFailure> {
+        let response = match self
+            .client
+            .post(&self.url)
+            .bearer_auth(&self.api_key)
+            .json(request)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(AttemptFailure {
+                    retryable: is_retryable_transport(&error),
+                    retry_after: None,
+                    source: FailureSource::Request(error),
+                });
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AttemptFailure {
+                retryable: is_retryable_status(status),
+                retry_after: parse_retry_after(response.headers()),
+                source: FailureSource::Status(status),
+            });
+        }
+
+        match response.text().await {
+            Ok(text) => Ok(text),
+            Err(error) => Err(AttemptFailure {
+                retryable: is_retryable_transport(&error),
+                retry_after: None,
+                source: FailureSource::Body(error),
+            }),
+        }
+    }
+}
+
+fn build_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn is_retryable_transport(error: &reqwest::Error) -> bool {
+    !error.is_builder()
+        && (error.is_timeout() || error.is_connect() || error.is_request() || error.is_body())
+}
+
+/// Only the delay-seconds form is supported; HTTP-date values are ignored and
+/// fall back to the deterministic backoff.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+fn shorten(text: &str, max_chars: usize) -> String {
+    let mut shortened: String = text.chars().take(max_chars).collect();
+    if text.chars().nth(max_chars).is_some() {
+        shortened.push('…');
+    }
+    shortened
+}
+
+pub(crate) struct OpenAiCompatibleAgentModel {
+    endpoint: ChatEndpoint,
     model: String,
     temperature: f64,
     allow_write: bool,
@@ -98,15 +340,8 @@ impl OpenAiCompatibleAgentModel {
         model: String,
         temperature: f64,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .context("failed to build HTTP client")?;
-
         Ok(Self {
-            client,
-            base_url,
-            api_key,
+            endpoint: ChatEndpoint::new(&base_url, api_key, RetryPolicy::default())?,
             model,
             temperature,
             allow_write: false,
@@ -123,6 +358,26 @@ impl OpenAiCompatibleAgentModel {
         self.allow_exec = allow_exec;
         self
     }
+
+    pub(crate) fn with_retry_notice<F>(mut self, observer: F) -> Self
+    where
+        F: FnMut(&RetryNotice) + Send + 'static,
+    {
+        self.endpoint.on_retry = Some(Box::new(observer));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.endpoint.retry = retry;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_http_timeout(mut self, timeout: Duration) -> Result<Self> {
+        self.endpoint = self.endpoint.with_timeout(timeout)?;
+        Ok(self)
+    }
 }
 
 impl AgentModel for OpenAiCompatibleAgentModel {
@@ -136,92 +391,27 @@ impl AgentModel for OpenAiCompatibleAgentModel {
             request.tools.push(build_run_command_tool());
         }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await
-            .context("failed to send agent request")?;
-
-        let status = response.status();
-
-        let text = response
-            .text()
-            .await
-            .context("failed to read agent response body")?;
-
-        ensure_success_status(status)?;
-
+        let text = self.endpoint.complete(&request, "agent").await?;
         parse_agent_decision(&text)
     }
 }
 
-pub async fn send_chat_request(
+pub(crate) async fn send_chat_request<F>(
     base_url: &str,
     api_key: &str,
     model: String,
     temperature: f64,
     prompt: String,
-) -> Result<String> {
+    on_retry: F,
+) -> Result<String>
+where
+    F: FnMut(&RetryNotice) + Send + 'static,
+{
     let request = build_chat_request(model, temperature, prompt);
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&request)
-        .send()
-        .await
-        .context("failed to send chat request")?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .context("failed to read chat response body")?;
-
-    ensure_success_status(status)?;
-
+    let mut endpoint = ChatEndpoint::new(base_url, api_key.to_string(), RetryPolicy::default())?;
+    endpoint.on_retry = Some(Box::new(on_retry));
+    let text = endpoint.complete(&request, "chat").await?;
     parse_chat_response(&text)
-}
-
-fn ensure_success_status(status: reqwest::StatusCode) -> Result<()> {
-    if !status.is_success() {
-        bail!("chat request failed with status {}", status);
-    }
-
-    Ok(())
-}
-
-fn build_add_tool() -> ChatTool {
-    ChatTool {
-        kind: "function".to_string(),
-        function: ChatFunctionDefinition {
-            name: "add".to_string(),
-            description: "Add two integers".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "a": {
-                        "type": "integer"
-                    },
-                    "b": {
-                        "type": "integer"
-                    }
-                },
-                "required": ["a", "b"],
-                "additionalProperties": false
-            }),
-        },
-    }
 }
 
 fn build_list_files_tool() -> ChatTool {
@@ -392,7 +582,6 @@ fn build_agent_chat_request(
         messages: build_chat_messages(messages),
         stream: false,
         tools: vec![
-            build_add_tool(),
             build_list_files_tool(),
             build_read_file_tool(),
             build_search_code_tool(),
@@ -464,6 +653,8 @@ fn build_chat_request(model: String, temperature: f64, prompt: String) -> ChatRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -546,21 +737,51 @@ mod tests {
     }
 
     #[test]
-    fn accepts_success_status() {
-        let result = ensure_success_status(reqwest::StatusCode::OK);
-
-        assert!(result.is_ok());
+    fn classifies_retryable_statuses() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [200, 400, 401, 403, 404, 409, 422] {
+            assert!(!is_retryable_status(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
     }
 
     #[test]
-    fn rejects_error_status() {
-        let error = ensure_success_status(reqwest::StatusCode::UNAUTHORIZED).unwrap_err();
+    fn retry_policy_backs_off_exponentially_with_a_cap() {
+        let policy = RetryPolicy::default();
 
-        assert!(
-            error
-                .to_string()
-                .contains("chat request failed with status 401 Unauthorized")
+        assert_eq!(policy.delay_for(1, None), Duration::from_secs(1));
+        assert_eq!(policy.delay_for(2, None), Duration::from_secs(2));
+        assert_eq!(policy.delay_for(3, None), Duration::from_secs(4));
+        assert_eq!(policy.delay_for(6, None), Duration::from_secs(30));
+        assert_eq!(
+            policy.delay_for(1, Some(Duration::from_secs(5))),
+            Duration::from_secs(5)
         );
+        assert_eq!(
+            policy.delay_for(1, Some(Duration::from_secs(120))),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn parses_retry_after_seconds_only() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
+
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(2)));
+
+        let mut date = reqwest::header::HeaderMap::new();
+        date.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+
+        assert_eq!(parse_retry_after(&date), None);
     }
 
     #[test]
@@ -658,35 +879,8 @@ mod tests {
     }
 
     #[test]
-    fn builds_add_tool_definition() {
-        let tool = build_add_tool();
-        let value = serde_json::to_value(tool).unwrap();
-
-        assert_eq!(value["type"], "function");
-        assert_eq!(value["function"]["name"], "add");
-        assert_eq!(value["function"]["parameters"]["type"], "object");
-
-        assert_eq!(
-            value["function"]["parameters"]["properties"]["a"]["type"],
-            "integer"
-        );
-        assert_eq!(
-            value["function"]["parameters"]["properties"]["b"]["type"],
-            "integer"
-        );
-        assert_eq!(
-            value["function"]["parameters"]["required"],
-            serde_json::json!(["a", "b"])
-        );
-        assert_eq!(
-            value["function"]["parameters"]["additionalProperties"],
-            false
-        );
-    }
-
-    #[test]
     fn builds_agent_chat_request_with_history_and_tools() {
-        let messages = vec![AgentMessage::User("add 2 and 3".to_string())];
+        let messages = vec![AgentMessage::User("read the readme".to_string())];
 
         let request = build_agent_chat_request("gpt-4.1".to_string(), 0.7, &messages);
 
@@ -694,9 +888,9 @@ mod tests {
 
         assert_eq!(value["model"], "gpt-4.1");
         assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["messages"][0]["content"], "add 2 and 3");
+        assert_eq!(value["messages"][0]["content"], "read the readme");
         assert_eq!(value["tools"][0]["type"], "function");
-        assert_eq!(value["tools"][0]["function"]["name"], "add");
+        assert_eq!(value["tools"][0]["function"]["name"], "list_files");
     }
 
     #[test]
@@ -905,8 +1099,166 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "chat request failed with status 401 Unauthorized"
+            "agent request failed with status 401 Unauthorized"
         );
+    }
+
+    #[tokio::test]
+    async fn next_decision_retries_transient_failure_and_reports_notice() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "recovered"}}]
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let captured = notices.clone();
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(3))
+        .with_retry_notice(move |notice| {
+            captured.lock().unwrap().push((
+                notice.attempt,
+                notice.next_attempt(),
+                notice.max_attempts,
+                notice.delay,
+                notice.reason.clone(),
+            ));
+        });
+
+        let decision = model
+            .next_decision(&[AgentMessage::User("hello".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            decision,
+            ModelDecision::FinalAnswer("recovered".to_string())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!((notices[0].0, notices[0].1, notices[0].2), (1, 2, 3));
+        assert_eq!(notices[0].3, Duration::ZERO);
+        assert!(notices[0].4.contains("503"));
+    }
+
+    #[tokio::test]
+    async fn next_decision_exhausts_retryable_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(3));
+
+        let error = model
+            .next_decision(&[AgentMessage::User("hello".to_string())])
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("503"), "{message}");
+        assert!(message.contains("after 3 attempts"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn next_decision_does_not_retry_client_errors() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(3));
+
+        let error = model
+            .next_decision(&[AgentMessage::User("hello".to_string())])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("400 Bad Request"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn next_decision_retries_timeout_then_succeeds() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(300))
+                        .set_body_json(serde_json::json!({
+                            "choices": [{"message": {"content": "too late"}}]
+                        }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "choices": [{"message": {"content": "on time"}}]
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut model = OpenAiCompatibleAgentModel::new(
+            server.uri(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            0.2,
+        )
+        .unwrap()
+        .with_retry_policy(RetryPolicy::immediate(2))
+        .with_http_timeout(Duration::from_millis(50))
+        .unwrap();
+
+        let decision = model
+            .next_decision(&[AgentMessage::User("hello".to_string())])
+            .await
+            .unwrap();
+
+        assert_eq!(decision, ModelDecision::FinalAnswer("on time".to_string()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

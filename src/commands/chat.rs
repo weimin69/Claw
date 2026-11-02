@@ -33,6 +33,15 @@ pub async fn execute(config_path: &str, prompt: Option<String>) -> Result<()> {
         llm.model,
         llm.temperature,
         prompt,
+        |notice| {
+            eprintln!(
+                "模型请求失败（{}），{:.1}s 后重试（第 {}/{} 次尝试）",
+                notice.reason,
+                notice.delay.as_secs_f64(),
+                notice.next_attempt(),
+                notice.max_attempts
+            );
+        },
     )
     .await?;
 

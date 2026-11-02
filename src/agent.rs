@@ -1469,24 +1469,26 @@ mod tests {
             ModelDecision::ToolCalls(vec![
                 ToolCall {
                     id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    input: r#"{"a":1,"b":2}"#.to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"a.txt"}"#.to_string(),
                 },
                 ToolCall {
                     id: "call-2".to_string(),
-                    name: "add".to_string(),
-                    input: r#"{"a":3,"b":4}"#.to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"b.txt"}"#.to_string(),
                 },
             ]),
-            ModelDecision::FinalAnswer("3 and 7".to_string()),
+            ModelDecision::FinalAnswer("read both".to_string()),
         ]);
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "first\n").unwrap();
+        std::fs::write(directory.path().join("b.txt"), "second\n").unwrap();
         let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
         let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
         let answer = run_agent(
             &mut model,
-            "give two sums".to_string(),
+            "read both files".to_string(),
             Some(2),
             Some(32),
             &mut tool_executor,
@@ -1496,39 +1498,28 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(answer.answer, "3 and 7");
+        assert_eq!(answer.answer, "read both");
         assert_eq!(answer.iterations, 2);
-        assert_eq!(answer.tool_calls, BTreeMap::from([("add".to_string(), 2)]));
         assert_eq!(
-            model.received_messages[1],
-            vec![
-                AgentMessage::User("give two sums".to_string()),
-                AgentMessage::AssistantToolCalls(vec![
-                    ToolCall {
-                        id: "call-1".to_string(),
-                        name: "add".to_string(),
-                        input: r#"{"a":1,"b":2}"#.to_string(),
-                    },
-                    ToolCall {
-                        id: "call-2".to_string(),
-                        name: "add".to_string(),
-                        input: r#"{"a":3,"b":4}"#.to_string(),
-                    },
-                ]),
-                AgentMessage::ToolResult {
-                    tool_call_id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    output: "3".to_string(),
-                    is_error: false,
-                },
-                AgentMessage::ToolResult {
-                    tool_call_id: "call-2".to_string(),
-                    name: "add".to_string(),
-                    output: "7".to_string(),
-                    is_error: false,
-                },
-            ]
+            answer.tool_calls,
+            BTreeMap::from([("read_file".to_string(), 2)])
         );
+
+        let messages = &model.received_messages[1];
+        assert_eq!(messages.len(), 4);
+        for (index, expected) in [(2, "first\n"), (3, "second\n")] {
+            let AgentMessage::ToolResult {
+                output, is_error, ..
+            } = &messages[index]
+            else {
+                panic!("expected a tool result at {index}");
+            };
+            assert!(!is_error);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(output).unwrap()["content"],
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -1537,18 +1528,19 @@ mod tests {
             ModelDecision::ToolCalls(vec![
                 ToolCall {
                     id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    input: r#"{"a":1,"b":2}"#.to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"a.txt"}"#.to_string(),
                 },
                 ToolCall {
                     id: "call-2".to_string(),
-                    name: "add".to_string(),
-                    input: r#"{"a":3}"#.to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":""}"#.to_string(),
                 },
             ]),
             ModelDecision::FinalAnswer("one call failed".to_string()),
         ]);
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.txt"), "first\n").unwrap();
         let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
         let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
@@ -1565,23 +1557,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(answer.answer, "one call failed");
+        let messages = &model.received_messages[1];
+
+        let AgentMessage::ToolResult {
+            tool_call_id,
+            output,
+            is_error,
+            ..
+        } = &messages[2]
+        else {
+            panic!("expected a successful tool result");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        assert!(!is_error);
         assert_eq!(
-            &model.received_messages[1][2..],
-            [
-                AgentMessage::ToolResult {
-                    tool_call_id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    output: "3".to_string(),
-                    is_error: false,
-                },
-                AgentMessage::ToolResult {
-                    tool_call_id: "call-2".to_string(),
-                    name: "add".to_string(),
-                    output: "invalid add tool input".to_string(),
-                    is_error: true,
-                },
-            ]
+            serde_json::from_str::<serde_json::Value>(output).unwrap()["content"],
+            "first\n"
         );
+
+        let AgentMessage::ToolResult {
+            tool_call_id,
+            output,
+            is_error,
+            ..
+        } = &messages[3]
+        else {
+            panic!("expected a failed tool result");
+        };
+        assert_eq!(tool_call_id, "call-2");
+        assert!(is_error);
+        assert!(output.contains("must not be empty"), "{output}");
     }
 
     #[tokio::test]
@@ -1694,23 +1699,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_uses_builtin_add_tool() {
+    async fn agent_uses_builtin_read_only_tool() {
         let mut model = FakeModel::new(vec![
             ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
-                name: "add".to_string(),
-                input: r#"{"a":2,"b":3}"#.to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"notes.txt"}"#.to_string(),
             }]),
-            ModelDecision::FinalAnswer("5".to_string()),
+            ModelDecision::FinalAnswer("read it".to_string()),
         ]);
 
         let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "hello\n").unwrap();
         let workspace = crate::workspace::Workspace::new(directory.path()).unwrap();
         let mut tool_executor = BuiltinToolExecutor::new(workspace);
 
         let result = run_agent(
             &mut model,
-            "add 2 and 3".to_string(),
+            "read notes.txt".to_string(),
             Some(2),
             Some(32),
             &mut tool_executor,
@@ -1720,25 +1726,43 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.answer, "5");
+        assert_eq!(result.answer, "read it");
         assert_eq!(model.received_messages.len(), 2);
 
+        let messages = &model.received_messages[1];
         assert_eq!(
-            model.received_messages[1],
-            vec![
-                AgentMessage::User("add 2 and 3".to_string()),
-                AgentMessage::AssistantToolCalls(vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    input: r#"{"a":2,"b":3}"#.to_string(),
-                }]),
-                AgentMessage::ToolResult {
-                    tool_call_id: "call-1".to_string(),
-                    name: "add".to_string(),
-                    output: "5".to_string(),
-                    is_error: false,
-                },
-            ]
+            messages[0],
+            AgentMessage::User("read notes.txt".to_string())
+        );
+        assert_eq!(
+            messages[1],
+            AgentMessage::AssistantToolCalls(vec![ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"notes.txt"}"#.to_string(),
+            }])
+        );
+        let AgentMessage::ToolResult {
+            tool_call_id,
+            name,
+            output,
+            is_error,
+        } = &messages[2]
+        else {
+            panic!("expected a tool result, got {:?}", messages[2]);
+        };
+        assert_eq!(tool_call_id, "call-1");
+        assert_eq!(name, "read_file");
+        assert!(!is_error);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(output).unwrap(),
+            serde_json::json!({
+                "path": "notes.txt",
+                "start_line": 1,
+                "end_line": 1,
+                "content": "hello\n",
+                "truncated": false
+            })
         );
     }
 
@@ -1747,8 +1771,8 @@ mod tests {
         let mut model = FakeModel::new(vec![
             ModelDecision::ToolCalls(vec![ToolCall {
                 id: "call-1".to_string(),
-                name: "add".to_string(),
-                input: r#"{"a":2}"#.to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":""}"#.to_string(),
             }]),
             ModelDecision::FinalAnswer("The tool input was invalid".to_string()),
         ]);
@@ -1758,7 +1782,7 @@ mod tests {
 
         let answer = run_agent(
             &mut model,
-            "add with invalid input".to_string(),
+            "read with invalid input".to_string(),
             Some(2),
             Some(32),
             &mut tool_executor,
@@ -1769,15 +1793,19 @@ mod tests {
         .unwrap();
 
         assert_eq!(answer.answer, "The tool input was invalid");
-        assert_eq!(
-            model.received_messages[1].last(),
-            Some(&AgentMessage::ToolResult {
-                tool_call_id: "call-1".to_string(),
-                name: "add".to_string(),
-                output: "invalid add tool input".to_string(),
-                is_error: true,
-            })
-        );
+        let Some(AgentMessage::ToolResult {
+            tool_call_id,
+            name,
+            output,
+            is_error,
+        }) = model.received_messages[1].last()
+        else {
+            panic!("expected a tool result");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        assert_eq!(name, "read_file");
+        assert!(*is_error);
+        assert!(output.contains("must not be empty"), "{output}");
     }
 }
 /*这里是对本文件的补充说明，也就是个人笔记

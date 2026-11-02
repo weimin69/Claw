@@ -1,4 +1,6 @@
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -124,10 +126,45 @@ async fn interactive_claw_cancels_while_waiting_for_user_input() {
 }
 
 #[tokio::test]
+async fn claw_retries_transient_model_failure() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    Mock::given(method("POST"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503)
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": "recovered"}}]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let config = write_temp_config(&format!(
+        "[llm]\nbase_url = {:?}\napi_key = \"test-key\"\nmodel = \"test-model\"\n",
+        server.uri()
+    ));
+    Command::cargo_bin("agent-cli-rust")
+        .unwrap()
+        .arg("claw")
+        .arg(config.path())
+        .arg("hello")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(contains("recovered"))
+        .stderr(contains("[模型请求] 失败").and(contains("重试（第 2/3 次尝试）")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn interactive_claw_stops_on_model_failure_without_processing_next_input() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(400))
         .expect(1)
         .mount(&server)
         .await;
@@ -785,7 +822,7 @@ async fn claw_passes_explicit_budgets_to_runtime() {
                     "tool_calls": [{
                         "id": "call-1",
                         "type": "function",
-                        "function": {"name": "add", "arguments": "{\"a\":2,\"b\":3}"}
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"Cargo.toml\"}"}
                     }]
                 }}]
             })))
@@ -924,7 +961,7 @@ async fn claw_prints_final_answer_from_mock_server() {
             "tools": [{
                 "type": "function",
                 "function": {
-                    "name": "add"
+                    "name": "list_files"
                 }
             }]
         })))
@@ -965,98 +1002,98 @@ temperature = 0.2
 
 #[tokio::test]
 async fn claw_executes_tool_and_prints_final_answer() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "hello from tool\n").unwrap();
     let server = MockServer::start().await;
-    let add_tool = serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "add",
-            "description": "Add two integers",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "a": {
-                        "type": "integer"
-                    },
-                    "b": {
-                        "type": "integer"
-                    }
-                },
-                "required": ["a", "b"],
-                "additionalProperties": false
-            }
-        }
-    });
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
-        .and(body_json(serde_json::json!({
-            "model": "test-model",
-            "temperature": 0.2,
-            "messages": [{
-                "role": "user",
-                "content": "add 2 and 3"
-            }],
-            "stream": false,
-            "tools": [add_tool.clone(), list_files_tool_definition(), read_file_tool_definition(), search_code_tool_definition()]
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {
-                            "name": "add",
-                            "arguments": "{\"a\":2,\"b\":3}"
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            if messages.len() == 1 {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\":\"notes.txt\"}"
+                                }
+                            }]
                         }
                     }]
-                }
-            }]
-        })))
-        .expect(1)
+                }))
+            } else {
+                assert_eq!(messages[2]["role"], "tool");
+                assert!(
+                    messages[2]["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("hello from tool")
+                );
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "The file says hello"
+                        }
+                    }]
+                }))
+            }
+        })
+        .expect(2)
         .mount(&server)
         .await;
 
+    let config_file = write_temp_config(&format!(
+        r#"[llm]
+base_url = "{}"
+api_key = "test-key"
+model = "test-model"
+temperature = 0.2
+"#,
+        server.uri()
+    ));
+
+    let mut command = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    command
+        .arg("claw")
+        .arg(config_file.path())
+        .arg("read notes.txt")
+        .arg("--workspace")
+        .arg(workspace.path())
+        .assert()
+        .success()
+        .stdout(
+            "The file says hello\n\n执行统计：\n变更文件：\n  无\n执行命令：\n  无\n工具调用：\n  read_file: 1 次\n工具调用总数：1\nLoop 次数：2\n",
+        )
+        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
+}
+
+#[tokio::test]
+async fn claw_exposes_only_builtin_read_only_tools_by_default() {
+    let server = MockServer::start().await;
+
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .and(header("authorization", "Bearer test-key"))
         .and(body_json(serde_json::json!({
             "model": "test-model",
             "temperature": 0.2,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "add 2 and 3"
-                },
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {
-                            "name": "add",
-                            "arguments": "{\"a\":2,\"b\":3}"
-                        }
-                    }]
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call-1",
-                    "content": "5"
-                }
-            ],
+            "messages": [{"role": "user", "content": "hello"}],
             "stream": false,
-            "tools": [add_tool, list_files_tool_definition(), read_file_tool_definition(), search_code_tool_definition()]
+            "tools": [
+                list_files_tool_definition(),
+                read_file_tool_definition(),
+                search_code_tool_definition()
+            ]
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "The result is 5"
-                }
-            }]
+            "choices": [{"message": {"content": "listed"}}]
         })))
         .expect(1)
         .mount(&server)
@@ -1077,11 +1114,12 @@ temperature = 0.2
     command
         .arg("claw")
         .arg(config_file.path())
-        .arg("add 2 and 3")
+        .arg("hello")
+        .arg("--workspace")
+        .arg(config_file.path().parent().unwrap())
         .assert()
         .success()
-        .stdout("The result is 5\n\n执行统计：\n变更文件：\n  无\n执行命令：\n  无\n工具调用：\n  add: 1 次\n工具调用总数：1\nLoop 次数：2\n")
-        .stderr(contains("等待模型响应").and(contains("模型响应完成")));
+        .stdout(contains("listed"));
 }
 
 #[tokio::test]

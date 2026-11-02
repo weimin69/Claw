@@ -203,7 +203,7 @@ async fn failed_resumed_request_does_not_modify_snapshot() {
     let path = directory.path().join("history.json");
     let before = snapshot(&path, directory.path());
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(ResponseTemplate::new(400))
         .expect(1)
         .mount(&server)
         .await;

@@ -90,7 +90,6 @@ cargo run -- claw Config.toml "修复问题并运行测试" \
 
 | 工具 | 作用 | 授权 |
 | --- | --- | --- |
-| `add` | 整数加法 | 默认可用 |
 | `list_files` | 列出 workspace 内目录的直接子项 | 默认可用 |
 | `read_file` | 有界读取 UTF-8 普通文件，可指定行范围 | 默认可用 |
 | `search_code` | 有界递归字面搜索，返回相对路径及行号 | 默认可用 |

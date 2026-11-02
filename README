@@ -1,63 +1,341 @@
 agent-cli-rust
 ==============
 
-A lightweight terminal-based Software Engineering Agent written in Rust.
+A terminal-based software engineering agent written in Rust.
 
-Project Status
+The agent works inside one authorized project directory. It explores
+the tree, reads and searches source code, edits files, runs development
+commands, and reports what it changed after every turn. Plain chat is a
+secondary mode.
+
+Version 0.1.0, pre-release. No license file is shipped yet.
+
+
+STATUS
+------
+
+The end-to-end coding loop (explore, modify, build, verify) is covered
+by deterministic tests with scripted model responses. Real-model
+evaluation and a public release are still open. PROJECT_STATUS.md is the
+source of truth for what is and is not implemented.
+
+
+BUILDING
+--------
+
+    cargo build --release
+    ./target/release/agent-cli-rust --version
+
+A Rust toolchain with edition 2024 support is required. The project has
+no services or database; all state lives in local files.
+
+
+CONFIGURATION
+-------------
+
+Commands that talk to a model take a TOML file as their first argument.
+Every field of the [llm] section is optional:
+
+    [llm]
+    base_url    = "https://api.openai.com/v1"
+    api_key     = ""
+    model       = "gpt-4.1"
+    temperature = 0.7
+
+If api_key is empty, the environment variable AGENT_CLI_LLM_API_KEY is
+used. model must not be blank and temperature must be within 0.0-2.0. A
+still-empty key is rejected before any request is sent.
+
+Config.toml in the working tree is a local file. Keep real credentials
+out of the repository.
+
+    agent-cli-rust read-config Config.toml
+
+prints the base URL, model and temperature, and reports only whether a
+key is set.
+
+
+SYNOPSIS
+--------
+
+    agent-cli-rust claw <CONFIG_PATH> [PROMPT] [OPTIONS]
+
+Runs one coding task. If PROMPT is omitted it is read from stdin until
+EOF; blank input is rejected.
+
+    agent-cli-rust claw Config.toml "fix the failing test in src/lib.rs"
+
+    agent-cli-rust claw Config.toml --interactive --workspace ../project \
+        --allow-write --allow-exec
+
+
+OPTIONS
+-------
+
+    --workspace <DIR>
+        Project directory exposed to the tools. It must exist and is
+        canonicalized at startup. Default: current directory.
+
+    --allow-write
+        Expose create_file and replace_text. Off by default.
+
+    --allow-exec
+        Expose run_command. Off by default. Independent of
+        --allow-write, because an authorized command can write files by
+        itself.
+
+    --max-iterations <N>
+        Maximum model turns per request. Default: unlimited.
+
+    --max-tool-calls <N>
+        Maximum tool calls per request. Default: unlimited. A batch that
+        would exceed the budget is rejected as a whole.
+
+    --max-context-bytes <N>
+        Context budget in bytes of internal message JSON, not tokens.
+        Default: 262144 (256 KiB).
+
+    --interactive
+        Multi-turn mode, one message per terminal line. See SESSIONS.
+
+    --session-file <PATH>
+        Write completed turns to a new archive file. Requires
+        --interactive, refuses to overwrite, and the parent directory
+        must exist.
+
+    --resume <PATH>
+        Load an existing archive and keep updating it. Requires
+        --interactive and conflicts with --session-file.
+
+Permissions and budgets always come from the current invocation. They
+are not stored in an archive and are not restored from one.
+
+
+TOOLS
+-----
+
+Read-only tools are always available inside the workspace:
+
+    list_files <path>
+        Direct children of a directory, workspace-relative, sorted. At
+        most 200 entries plus a truncation flag. Symlinks are listed but
+        not followed.
+
+    read_file <path> [start_line] [end_line]
+        A UTF-8 regular file of at most 1 MiB. Lines are 1-based and
+        inclusive; the default is 200 lines from line 1. At most 500
+        lines and 32 KiB of content are returned, with a truncation
+        flag.
+
+    search_code <pattern> <path>
+        Case-sensitive literal search of one file or a directory tree.
+        Skips symlinks, .git, target, binary and non-UTF-8 files, and
+        files above 1 MiB. Bounded by 5000 directory entries, 8 MiB
+        scanned, 100 matching lines, 1 KiB per excerpt and 32 KiB of
+        JSON. Does not apply .gitignore rules.
+
+Write tools, enabled by --allow-write:
+
+    create_file <path> <content>
+        Creates a file of at most 1 MiB. Never overwrites an existing
+        target and never creates parent directories.
+
+    replace_text <path> <edits | old_text + new_text>
+        Applies 1-100 exact replacements in order. Each old_text must
+        occur exactly once in the content produced by the previous edit.
+        Edits are prepared in memory and saved once, only if every edit
+        applies. The file is at most 1 MiB before and after. Returns a
+        bounded diff. Does not create or delete files.
+
+Exec tool, enabled by --allow-exec:
+
+    run_command <program> <args> [cwd] [timeout_seconds]
+        Runs a program with an argument vector, not through a shell,
+        inside the workspace. The default timeout is 60 seconds and the
+        allowed range is 1-300. stdin is closed; stdout and stderr are
+        drained concurrently and each keeps the first 32 KiB. Nonzero
+        exits and timeouts are recoverable tool failures returned to the
+        model.
+
+Child processes are started without AGENT_CLI_LLM_API_KEY and
+OPENAI_API_KEY. On Unix a command runs in its own process group, which
+is killed on timeout or cancellation; descendants that leave the group
+can escape.
+
+
+PERMISSIONS AND SAFETY
+----------------------
+
+Workspace checks reject paths outside the project root, including
+symlinks that resolve outside it. They are boundary checks, not a
+sandbox. There is no OS isolation, no per-command approval and no
+command filter. --allow-exec lets the model run arbitrary programs with
+your user privileges, so grant it only in repositories you trust.
+
+Model-provided tool arguments are untrusted input. File tool output is
+bounded, command output is bounded per stream, and every change and
+command is listed after the turn so you can inspect it.
+
+
+SESSIONS
+--------
+
+--interactive keeps one conversation until /exit, EOF or Ctrl+C. Blank
+lines are ignored. After every completed turn the conversation is
+written to:
+
+    <workspace>/.agent-cli/sessions/<unix_ms>-<random>.json
+
+Empty conversations are not written. Startup never resumes a previous
+conversation automatically. Archives are limited to 16 MiB; new files
+use mode 0600 on Unix and the directory uses 0700. The sessions
+directory is listed in .gitignore. An archive can contain prompts,
+source code and tool output, so do not publish one.
+
+Interactive commands:
+
+    /sessions      List up to 20 archives for this workspace.
+    /resume <n>    Load entry n from that listing and continue in it.
+    /new           Start a new conversation and a new archive.
+    /exit          Leave.
+
+/resume accepts only an entry from the most recent /sessions listing. It
+validates the archive version (1-3) and that the saved workspace is the
+current one. A failed resume keeps the current conversation. Restored
+history is context only: old tool calls are not replayed, and the
+current flags decide what may run now.
+
+--session-file is explicit and refuses to overwrite. --resume updates
+the file it loaded and keeps the last good snapshot if a request fails.
+
+
+CONTEXT BUDGET
 --------------
 
-  This project is under active development.
-
-  Currently available:
-
-  - OpenAI-compatible single-turn chat
-  - TOML-based LLM configuration
-  - Environment-variable API key fallback
-  - HTTP fetch command
-  - Minimal Agent Runtime
-  - Structured tool calling with a built-in add tool
-  - Deterministic unit and CLI integration tests
-
-  The Agent Runtime is not yet connected to the CLI.
-
-  ## Commands
-
-  ### Chat
-
-  cargo run -- chat <CONFIG_PATH> [PROMPT]
-
-  When PROMPT is omitted, input is read from stdin.
-
-  ### Read configuration
-
-  cargo run -- read-config <CONFIG_PATH>
-
-  The command reports whether an API key is configured without printing it.
-
-  ### Fetch
-
-  cargo run -- fetch <URL> [--max-chars N]
-
-  ### Version
-
-  cargo run -- --version
-
-  ## Configuration
-
-  [llm]
-  base_url = "https://api.openai.com/v1"
-  api_key = "xx"
-  model = "gpt-4.1"
-  temperature = 0.7
+--max-context-bytes limits the internal message JSON sent to the model.
+It is not a token budget. Before each request the oldest complete turns
+are dropped from the model context while the full history stays on
+disk, and a notice is printed. An input that exceeds the budget by
+itself is not sent. A turn whose tool output pushes the context over the
+budget ends the session instead of starting another request.
 
 
+EXECUTION REPORT
+----------------
+
+After each successful turn the CLI prints the final answer, then:
+
+    Changed files   created files and per-file edit counts.
+    Commands        program, arguments and exit code, timeout or signal;
+                    each line is capped at 160 characters.
+    Tool calls      per-tool counts, total calls and loop count.
+
+Effects are recorded only when a write succeeded or a process started,
+so failed calls are not reported as changes. File writes performed
+inside run_command are invisible, and effects are not persisted: the
+report is a summary, not an audit log. Failed or cancelled turns print
+no report, and completed steps are not rolled back.
 
 
-  src/
-  ├── main.rs                 CLI entry and command dispatch
-  ├── cli.rs                  CLI definitions
-  ├── config.rs               Configuration loading and validation
-  ├── agent.rs                Agent execution loop
-  ├── tools.rs                Built-in tool execution
-  ├── openai_compatible.rs    OpenAI-compatible protocol integration
-  └── commands/               User-facing CLI commands
+OTHER COMMANDS
+--------------
+
+    chat <CONFIG_PATH> [PROMPT]
+        Single-turn model call without tools and without a session.
+        PROMPT is read from stdin when omitted.
+
+    fetch <URL> [--max-chars N]
+        GET a URL with a 60-second timeout and print the first N
+        characters (default 200). Non-2xx responses are errors.
+
+    read-config <PATH>
+        Load and validate a configuration file without printing the key.
+
+    --version, --help
+        Version (top level only) and command help.
+
+
+EXIT STATUS
+-----------
+
+    0     Success.
+    1     Any error. Details go to stderr as "error: ..." followed by a
+          "caused by" chain.
+    130   Interrupted by Ctrl+C.
+
+Recoverable tool failures (missing file, nonzero exit, timeout, invalid
+arguments) do not abort the run; they are returned to the model and may
+be corrected on the next turn. Fatal errors end the request, and an
+interactive session cannot be reused after one.
+
+Transient model failures are retried before they become fatal: HTTP 408,
+429, 500, 502, 503 and 504, connection failures, timeouts and interrupted
+bodies. The default is 3 attempts in total, waiting 1 s and then 2 s; a
+provider Retry-After in seconds replaces that wait but is capped at 30 s,
+and each retry is announced on stderr. Client errors (400, 401, 403,
+404), invalid responses and exhausted retries fail immediately with the
+attempt count in the message.
+
+
+FILES
+-----
+
+    src/main.rs                 entry point, dispatch, error output
+    src/cli.rs                  command definitions and argument checks
+    src/config.rs               TOML loading, defaults, validation
+    src/agent.rs                runtime loop, messages, budgets, events
+    src/openai_compatible.rs    protocol DTOs, tool schemas, HTTP
+    src/session.rs              archive format, listing, atomic save
+    src/workspace.rs            root resolution and boundary checks
+    src/tools.rs                tool dispatch and read-only tools
+    src/tools/edit.rs           replace_text planning and saving
+    src/tools/create.rs         create_file without clobbering
+    src/tools/command.rs        process spawn, output limits, timeouts
+    src/tools/search.rs         bounded literal tree search
+    src/commands/claw.rs        agent CLI, interactive loop, reports
+    src/commands/chat.rs        single-turn chat
+    src/commands/fetch.rs       HTTP fetch
+    src/commands/read_config.rs configuration summary
+
+    tests/                      unit and integration tests
+    SESSIONS.md                 detailed CLI and session guide
+    PROJECT_STATUS.md           verified progress and known gaps
+    LEARNING_ROADMAP.md         engineering roadmap
+    journal/                    development log
+
+
+TESTING
+-------
+
+    cargo test
+    cargo clippy --all-targets -- -D warnings
+    cargo fmt --check
+
+The suite is deterministic: model responses come from Wiremock, and no
+test needs a real API key, network access or provider availability.
+Current total: 217 tests.
+
+
+LIMITATIONS
+-----------
+
+    - Model responses are not streamed.
+    - Context control is byte-based; there is no token accounting,
+      automatic summary or compaction.
+    - No OS sandbox, per-command approval or command allowlist.
+    - No overall task time limit and no cancellation of a blocking tool;
+      the limits are Ctrl+C, command timeouts and iteration budgets.
+    - Effects and traces are not persisted, so a run cannot be replayed.
+    - search_code ignores .gitignore and may return an incomplete subset.
+    - Session archives are checked before replacement; a concurrent
+      writer can still race with that check.
+    - chat remains a minimal no-tool entry point.
+
+
+DOCUMENTATION
+-------------
+
+    SESSIONS.md          Full CLI and session reference.
+    PROJECT_STATUS.md    Completed work, open work, technical debt.
+    LEARNING_ROADMAP.md  Phases 0-8 and their acceptance criteria.
+    journal/             Session-by-session engineering log.

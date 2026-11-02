@@ -158,7 +158,7 @@ async fn failed_turn_preserves_last_completed_snapshot() {
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"choices":[{"message":{"content":"saved answer"}}]}))
             } else {
-                ResponseTemplate::new(500)
+                ResponseTemplate::new(400)
             }
         })
         .expect(2)

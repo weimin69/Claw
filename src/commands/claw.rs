@@ -96,7 +96,16 @@ pub async fn execute(
     let mut model =
         OpenAiCompatibleAgentModel::new(llm.base_url, llm.api_key, llm.model, llm.temperature)?
             .with_write_access(allow_write)
-            .with_exec_access(allow_exec);
+            .with_exec_access(allow_exec)
+            .with_retry_notice(|notice| {
+                eprintln!(
+                    "[模型请求] 失败（{}），{:.1}s 后重试（第 {}/{} 次尝试）",
+                    notice.reason,
+                    notice.delay.as_secs_f64(),
+                    notice.next_attempt(),
+                    notice.max_attempts
+                );
+            });
     let mut tool_executor = BuiltinToolExecutor::new(workspace)
         .with_write_access(allow_write)
         .with_exec_access(allow_exec);

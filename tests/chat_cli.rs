@@ -1,6 +1,9 @@
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::{contains, is_empty};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -121,6 +124,49 @@ async fn chat_reports_provider_error_status() {
         .failure()
         .stderr(contains("chat request failed with status 401"))
         .stdout(is_empty());
+}
+
+#[tokio::test]
+async fn chat_retries_transient_model_failure() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_request: &wiremock::Request| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(429)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"choices":[{"message":{"content":"recovered answer"}}]}"#)
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let config_file = write_temp_config(&format!(
+        r#"[llm]
+    base_url = "{}"
+    api_key = "test-key"
+    model = "test-model"
+    temperature = 0.7
+    "#,
+        server.uri()
+    ));
+
+    let mut cmd = Command::cargo_bin("agent-cli-rust").unwrap();
+
+    cmd.arg("chat")
+        .arg(config_file.path())
+        .arg("hello")
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .success()
+        .stdout(contains("recovered answer"))
+        .stderr(contains("模型请求失败").and(contains("重试（第 2/3 次尝试）")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
