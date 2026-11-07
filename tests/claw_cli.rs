@@ -161,11 +161,11 @@ async fn claw_retries_transient_model_failure() {
 }
 
 #[tokio::test]
-async fn interactive_claw_stops_on_model_failure_without_processing_next_input() {
+async fn interactive_claw_rolls_back_model_failure_and_accepts_next_input() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(400))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     let config = write_temp_config(&format!(
@@ -180,9 +180,10 @@ async fn interactive_claw_stops_on_model_failure_without_processing_next_input()
         .write_stdin("hello\nnext message\n")
         .timeout(std::time::Duration::from_secs(5))
         .assert()
-        .failure()
+        .success()
         .stdout(is_empty())
-        .stderr(contains("error:").and(contains("模型响应失败")));
+        .stderr(contains("本轮失败").and(contains("模型响应失败")));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }
 
 #[cfg(unix)]

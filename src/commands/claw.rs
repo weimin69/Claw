@@ -1,5 +1,6 @@
 use crate::agent::{
-    AgentEvent, AgentRunResult, AgentSession, ContextLimitExceeded, ToolEffect, run_agent,
+    AgentEvent, AgentRunResult, AgentSession, ContextLimitExceeded, ContextLimitStage, ToolEffect,
+    run_agent,
 };
 use crate::openai_compatible::OpenAiCompatibleAgentModel;
 use crate::session::{SessionStore, list_sessions};
@@ -304,25 +305,36 @@ async fn run_interactive(
             biased;
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl+C")?;
+                // The turn future is dropped; restore the conversation so that
+                // an in-process cancel (e.g. a future TUI) can keep going.
+                session.abort_turn();
                 return Err(Cancelled.into());
             }
             result = session.run_turn(model, input, max_iterations, max_tool_calls, tools, print_event) => result,
         };
         let result = match result {
             Ok(result) => result,
-            Err(error) if error.is::<ContextLimitExceeded>() && session.can_continue() => {
-                eprintln!(
-                    "{error}；本次输入未发送，原历史已保留。请缩短输入，或退出后开启新会话/调整预算。"
-                );
+            Err(error) if !session.can_continue() => return Err(error),
+            Err(error) if error.is::<ContextLimitExceeded>() => {
+                let stage = error
+                    .downcast_ref::<ContextLimitExceeded>()
+                    .map(|limit| limit.stage);
+                if stage == Some(ContextLimitStage::Input) {
+                    eprintln!(
+                        "{error}；本次输入未发送，原历史已保留。请缩短输入，或退出后开启新会话/调整预算。"
+                    );
+                } else {
+                    eprintln!(
+                        "{error}；工具执行后上下文超限，本轮已回滚到上一轮，可以继续输入。请缩短输入或使用 /new。已写入的文件与已执行的命令不会回滚。"
+                    );
+                }
                 continue;
             }
             Err(error) => {
-                if error.is::<ContextLimitExceeded>() {
-                    eprintln!(
-                        "工具执行后上下文超限，停止当前会话；保留上次成功存档，已执行的文件或命令操作不会回滚。"
-                    );
-                }
-                return Err(error);
+                eprintln!(
+                    "本轮失败，会话已回滚到上一轮，可以继续输入：{error:#}\n已写入的文件与已执行的命令不会回滚。"
+                );
+                continue;
             }
         };
         print_result(&result);

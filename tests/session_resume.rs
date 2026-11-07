@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::{Value, json};
 use std::{io::Write, path::Path, time::Duration};
@@ -196,7 +197,7 @@ async fn resumes_across_processes_updates_file_and_does_not_restore_permissions(
 }
 
 #[tokio::test]
-async fn failed_resumed_request_does_not_modify_snapshot() {
+async fn failed_resumed_request_rolls_back_without_modifying_snapshot() {
     let server = MockServer::start().await;
     let config = config(&server);
     let directory = tempfile::tempdir().unwrap();
@@ -219,7 +220,8 @@ async fn failed_resumed_request_does_not_modify_snapshot() {
         .write_stdin("1\n")
         .timeout(Duration::from_secs(10))
         .assert()
-        .failure();
+        .success()
+        .stderr(contains("本轮失败").and(contains("模型响应失败")));
     assert_eq!(std::fs::read(path).unwrap(), before);
 }
 

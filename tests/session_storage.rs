@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::{Value, json};
 use std::{io::Write, time::Duration};
@@ -154,14 +155,18 @@ async fn failed_turn_preserves_last_completed_snapshot() {
     Mock::given(method("POST"))
         .respond_with(|request: &wiremock::Request| {
             let body: Value = request.body_json().unwrap();
-            if body["messages"].as_array().unwrap().len() == 1 {
+            let messages = body["messages"].as_array().unwrap();
+            if messages.last().unwrap()["content"] == "second\n" {
+                ResponseTemplate::new(400)
+            } else if messages.len() == 1 {
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"choices":[{"message":{"content":"saved answer"}}]}))
             } else {
-                ResponseTemplate::new(400)
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"choices":[{"message":{"content":"after failure"}}]}))
             }
         })
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
     let config = config(&server);
@@ -174,14 +179,18 @@ async fn failed_turn_preserves_last_completed_snapshot() {
         .arg("--interactive")
         .arg("--session-file")
         .arg(&path)
-        .write_stdin("first\nsecond\n")
+        .write_stdin("first\nsecond\nthird\n/exit\n")
         .timeout(Duration::from_secs(10))
         .assert()
-        .failure()
-        .stdout(contains("saved answer"));
+        .success()
+        .stdout(contains("saved answer").and(contains("after failure")))
+        .stderr(contains("本轮失败"));
     let snapshot: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    assert_eq!(snapshot["full_history"].as_array().unwrap().len(), 2);
-    assert_eq!(snapshot["full_history"][1]["data"], "saved answer");
+    let history = snapshot["full_history"].as_array().unwrap();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[1]["data"], "saved answer");
+    assert_eq!(history[2]["data"], "third\n");
+    assert_eq!(history[3]["data"], "after failure");
 }
 
 #[tokio::test]

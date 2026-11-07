@@ -217,7 +217,8 @@ It is not a token budget. Before each request the oldest complete turns
 are dropped from the model context while the full history stays on
 disk, and a notice is printed. An input that exceeds the budget by
 itself is not sent. A turn whose tool output pushes the context over the
-budget ends the session instead of starting another request.
+budget fails and rolls the conversation back to the previous completed
+turn; the session stays usable.
 
 
 EXECUTION REPORT
@@ -234,7 +235,8 @@ Effects are recorded only when a write succeeded or a process started,
 so failed calls are not reported as changes. File writes performed
 inside run_command are invisible, and effects are not persisted: the
 report is a summary, not an audit log. Failed or cancelled turns print
-no report, and completed steps are not rolled back.
+no report. Their conversation is rolled back, but completed file writes
+and commands are not undone.
 
 
 OTHER COMMANDS
@@ -265,8 +267,10 @@ EXIT STATUS
 
 Recoverable tool failures (missing file, nonzero exit, timeout, invalid
 arguments) do not abort the run; they are returned to the model and may
-be corrected on the next turn. Fatal errors end the request, and an
-interactive session cannot be reused after one.
+be corrected on the next turn. Fatal request errors end only that turn:
+the conversation is rolled back to the last completed turn and the
+interactive session can still be used. Only an internal invariant
+violation closes the session.
 
 Transient model failures are retried before they become fatal: HTTP 408,
 429, 500, 502, 503 and 504, connection failures, timeouts and interrupted

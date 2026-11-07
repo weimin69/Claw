@@ -77,7 +77,7 @@ async fn noninteractive_rejects_before_http_and_cli_rejects_zero_budget() {
 }
 
 #[tokio::test]
-async fn tool_growth_preserves_resumed_snapshot_and_stops_before_next_request() {
+async fn tool_growth_rolls_back_the_turn_and_preserves_the_resumed_snapshot() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
         "choices":[{"message":{"content":null,"tool_calls":[{
@@ -108,8 +108,12 @@ async fn tool_growth_preserves_resumed_snapshot_and_stops_before_next_request() 
         .write_stdin("read the file\n")
         .timeout(Duration::from_secs(10))
         .assert()
-        .failure()
+        .success()
         .stdout(predicate::str::is_empty())
-        .stderr(predicate::str::contains("工具执行后上下文超限"));
+        .stderr(
+            predicate::str::contains("工具执行后上下文超限")
+                .and(predicate::str::contains("可以继续输入"))
+                .and(predicate::str::contains("不会回滚")),
+        );
     assert_eq!(std::fs::read(path).unwrap(), before);
 }

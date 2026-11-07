@@ -163,7 +163,7 @@ impl AgentState {
         let next = self
             .tool_calls
             .checked_add(count)
-            .context("tool call count overflow")?;
+            .ok_or_else(|| invariant(anyhow::anyhow!("tool call count overflow")))?;
 
         if self.max_tool_calls.is_some_and(|limit| next > limit) {
             bail!("agent reached maximum tool calls");
@@ -183,28 +183,68 @@ impl AgentState {
         self.iteration = self
             .iteration
             .checked_add(1)
-            .context("iteration count overflow")?;
+            .ok_or_else(|| invariant(anyhow::anyhow!("iteration count overflow")))?;
         Ok(())
     }
 }
 
-/// In-memory history. An interrupted/failed turn closes the session rather than
-/// reusing potentially incomplete assistant/tool message pairs.
+/// In-memory history. A failed or interrupted turn rolls the conversation back
+/// to the last completed turn. Only an internal invariant violation closes the
+/// session, because the history can no longer be trusted then.
 pub(crate) struct AgentSession {
     /// Original messages for persistence and audit; never replaced by a summary.
     full_history: Vec<AgentMessage>,
     /// The messages sent to the model. Temporarily owned by AgentState during a turn.
     working_context: Option<Vec<AgentMessage>>,
+    /// Snapshot used to roll back an in-flight turn, including one whose future
+    /// was dropped by cancellation.
+    pending_turn: Option<TurnCheckpoint>,
     closed: bool,
     max_context_bytes: usize,
 }
 
+struct TurnCheckpoint {
+    full_history_len: usize,
+    working_context: Option<Vec<AgentMessage>>,
+}
+
 pub(crate) const DEFAULT_MAX_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// Where the context size was checked. The CLI reports the two cases
+/// differently, and only `Input` means the request was never sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextLimitStage {
+    Input,
+    TurnInProgress,
+}
 
 #[derive(Debug)]
 pub(crate) struct ContextLimitExceeded {
     pub(crate) actual: usize,
     pub(crate) limit: usize,
+    pub(crate) stage: ContextLimitStage,
+}
+
+/// Marks failures that leave the in-memory session unsafe to reuse. Every other
+/// turn failure is recoverable: the conversation is rolled back and the session
+/// stays open.
+#[derive(Debug)]
+struct SessionInvariant(anyhow::Error);
+
+impl std::fmt::Display for SessionInvariant {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SessionInvariant {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+fn invariant(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(SessionInvariant(error))
 }
 
 impl std::fmt::Display for ContextLimitExceeded {
@@ -223,6 +263,7 @@ impl Default for AgentSession {
         Self {
             full_history: Vec::new(),
             working_context: None,
+            pending_turn: None,
             closed: false,
             max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
         }
@@ -271,6 +312,7 @@ impl AgentSession {
         Ok(Self {
             working_context: Some(messages.clone()),
             full_history: messages,
+            pending_turn: None,
             closed: false,
             max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
         })
@@ -298,19 +340,25 @@ impl AgentSession {
         if self.closed {
             bail!("agent session is closed after an interrupted or failed turn");
         }
+        if self.pending_turn.is_some() {
+            bail!("agent session already has an unfinished turn");
+        }
         let mut state = AgentState::new(prompt, max_iterations, max_tool_calls)?;
-        let had_context = self.working_context.is_some();
-        let mut messages = self.working_context.take().unwrap_or_default();
+        // Snapshot before handing the working context to AgentState. A dropped
+        // future (cancellation) cannot run cleanup inside this function, so the
+        // snapshot lives on the session and `abort_turn` restores it later.
+        let checkpoint = TurnCheckpoint {
+            full_history_len: self.full_history.len(),
+            working_context: self.working_context.take(),
+        };
+        let mut messages = checkpoint.working_context.clone().unwrap_or_default();
+        self.pending_turn = Some(checkpoint);
         let previous_len = messages.len();
         messages.append(&mut state.messages);
         state.messages = messages;
         let start = match context_start(&state.messages, self.max_context_bytes) {
             std::result::Result::Ok(start) => start,
-            Err(error) => {
-                state.messages.truncate(previous_len);
-                self.working_context = had_context.then_some(state.messages);
-                return Err(error);
-            }
+            Err(error) => return Err(self.fail_turn(error)),
         };
         // The input is accepted only after preflight succeeds. Do not append
         // rejected inputs, nor old working messages (which may later be summaries).
@@ -326,7 +374,7 @@ impl AgentSession {
                 turns: removed_turns,
             });
         }
-        let result = run_turn_loop(
+        let result = match run_turn_loop(
             model,
             &mut state,
             tool_executor,
@@ -334,10 +382,42 @@ impl AgentSession {
             self.max_context_bytes,
             &mut self.full_history,
         )
-        .await?;
+        .await
+        {
+            std::result::Result::Ok(result) => result,
+            Err(error) => return Err(self.fail_turn(error)),
+        };
+        self.pending_turn = None;
         self.working_context = Some(state.messages);
         self.closed = false;
         Ok(result)
+    }
+
+    /// Record a failed turn: always roll the conversation back, and close the
+    /// session only when the failure is an internal invariant violation.
+    fn fail_turn(&mut self, error: anyhow::Error) -> anyhow::Error {
+        let fatal = error.is::<SessionInvariant>();
+        self.rollback_turn();
+        if fatal {
+            self.closed = true;
+        }
+        error
+    }
+
+    /// Restore the conversation to the state before the in-flight turn. This
+    /// never touches files, commands or saved archives.
+    fn rollback_turn(&mut self) {
+        if let Some(checkpoint) = self.pending_turn.take() {
+            self.full_history.truncate(checkpoint.full_history_len);
+            self.working_context = checkpoint.working_context;
+            self.closed = false;
+        }
+    }
+
+    /// Restore the conversation after a cancelled turn. Idempotent, and safe to
+    /// call when no turn is in flight.
+    pub(crate) fn abort_turn(&mut self) {
+        self.rollback_turn();
     }
 }
 
@@ -425,7 +505,11 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
     loop {
         state.begin_iteration()?;
 
-        check_context_size(&state.messages, max_context_bytes)?;
+        check_context_size(
+            &state.messages,
+            max_context_bytes,
+            ContextLimitStage::TurnInProgress,
+        )?;
 
         on_event(AgentEvent::ModelStarted {
             iteration: state.iteration,
@@ -462,7 +546,9 @@ async fn run_turn_loop<M: AgentModel, T: ToolExecutor>(
 
                 for tool_call in tool_calls {
                     let count = tool_counts.entry(tool_call.name.clone()).or_default();
-                    *count = count.checked_add(1).context("tool usage count overflow")?;
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| invariant(anyhow::anyhow!("tool usage count overflow")))?;
                     on_event(AgentEvent::ToolStarted {
                         name: tool_call.name.clone(),
                     });
@@ -500,13 +586,19 @@ pub(crate) trait ToolExecutor {
     async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput>;
 }
 
-fn check_context_size(messages: &[AgentMessage], max_context_bytes: usize) -> Result<()> {
-    let bytes = serde_json::to_vec(messages).context("failed to serialize agent context")?;
+fn check_context_size(
+    messages: &[AgentMessage],
+    max_context_bytes: usize,
+    stage: ContextLimitStage,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(messages)
+        .map_err(|error| invariant(error.into()).context("failed to serialize agent context"))?;
 
     if bytes.len() > max_context_bytes {
         return Err(ContextLimitExceeded {
             actual: bytes.len(),
             limit: max_context_bytes,
+            stage,
         }
         .into());
     }
@@ -527,7 +619,11 @@ fn first_turn_end(messages: &[AgentMessage]) -> Option<usize> {
 fn context_start(messages: &[AgentMessage], max_context_bytes: usize) -> Result<usize> {
     let mut start = 0;
     loop {
-        match check_context_size(&messages[start..], max_context_bytes) {
+        match check_context_size(
+            &messages[start..],
+            max_context_bytes,
+            ContextLimitStage::Input,
+        ) {
             std::result::Result::Ok(()) => return Ok(start),
             Err(error) if error.is::<ContextLimitExceeded>() => {
                 match first_turn_end(&messages[start..]) {
@@ -716,7 +812,7 @@ mod tests {
         assert_eq!(session.working_context.as_deref().unwrap(), original);
         // Preflight must remove the oversized oldest turn automatically.
         session.set_context_limit(512).unwrap();
-        assert!(check_context_size(&original, 512).is_err());
+        assert!(check_context_size(&original, 512, ContextLimitStage::Input).is_err());
         let mut model = FakeModel::new(vec![ModelDecision::FinalAnswer("continued".into())]);
         let mut tools = FakeToolExecutor {
             output: ToolOutput::success("unused".into()),
@@ -772,8 +868,8 @@ mod tests {
         let messages = vec![AgentMessage::User("你好\n\"Rust\"".into())];
         let size = serde_json::to_vec(&messages).unwrap().len();
         assert!(size > "你好\n\"Rust\"".chars().count());
-        check_context_size(&messages, size).unwrap();
-        let error = check_context_size(&messages, size - 1).unwrap_err();
+        check_context_size(&messages, size, ContextLimitStage::Input).unwrap();
+        let error = check_context_size(&messages, size - 1, ContextLimitStage::Input).unwrap_err();
         let error = error.downcast_ref::<ContextLimitExceeded>().unwrap();
         assert_eq!(error.actual, size);
         assert_eq!(error.limit, size - 1);
@@ -827,7 +923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_output_growth_stops_before_next_model_request_and_closes_session() {
+    async fn tool_output_growth_rolls_back_the_turn_and_keeps_the_session_usable() {
         let mut session = AgentSession::default();
         session.set_context_limit(512).unwrap();
         let mut model = FakeModel::new(vec![
@@ -836,7 +932,7 @@ mod tests {
                 name: "read_file".into(),
                 input: "{}".into(),
             }]),
-            ModelDecision::FinalAnswer("must not be requested".into()),
+            ModelDecision::FinalAnswer("after rollback".into()),
         ]);
         let mut tools = FakeToolExecutor {
             output: ToolOutput::success("x".repeat(1024)),
@@ -846,11 +942,167 @@ mod tests {
             .run_turn(&mut model, "hello".into(), None, None, &mut tools, |_| {})
             .await
             .unwrap_err();
-        assert!(error.is::<ContextLimitExceeded>());
-        assert_eq!(model.received_messages.len(), 1);
-        assert_eq!(tools.calls.len(), 1);
+        let limit = error.downcast_ref::<ContextLimitExceeded>().unwrap();
+        assert_eq!(limit.stage, ContextLimitStage::TurnInProgress);
+        assert!(session.can_continue());
+        assert_eq!(session.full_history, Vec::<AgentMessage>::new());
+        assert!(session.working_context.is_none());
+        assert!(session.completed_messages().is_err());
+
+        // The failed turn is gone: the next request contains only the new input.
+        let result = session
+            .run_turn(&mut model, "again".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.answer, "after rollback");
+        assert_eq!(
+            model.received_messages[1],
+            vec![AgentMessage::User("again".into())]
+        );
+        assert_eq!(
+            session.completed_messages().unwrap(),
+            [
+                AgentMessage::User("again".into()),
+                AgentMessage::Assistant("after rollback".into())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn model_failure_after_tool_results_rolls_back_and_hides_the_tool_messages() {
+        let mut session = AgentSession::default();
+        let mut model = ScriptedModel::new(vec![
+            ScriptedStep::Decide(ModelDecision::FinalAnswer("first".into())),
+            ScriptedStep::Decide(ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call".into(),
+                name: "read_file".into(),
+                input: "{}".into(),
+            }])),
+            ScriptedStep::Fail,
+            ScriptedStep::Decide(ModelDecision::FinalAnswer("recovered".into())),
+        ]);
+        let mut tools = FakeToolExecutor {
+            output: ToolOutput::success("tool output".into()),
+            calls: vec![],
+        };
+        session
+            .run_turn(&mut model, "one".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        let completed = session.completed_messages().unwrap().to_vec();
+        let error = session
+            .run_turn(&mut model, "two".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("model unavailable"));
+        assert!(session.can_continue());
+        assert_eq!(session.completed_messages().unwrap(), completed);
+
+        let result = session
+            .run_turn(&mut model, "three".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.answer, "recovered");
+        let mut expected = completed;
+        expected.extend([
+            AgentMessage::User("three".into()),
+            AgentMessage::Assistant("recovered".into()),
+        ]);
+        assert_eq!(session.completed_messages().unwrap(), expected);
+        assert_eq!(
+            model.received_messages[3],
+            [
+                AgentMessage::User("one".into()),
+                AgentMessage::Assistant("first".into()),
+                AgentMessage::User("three".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_tool_error_rolls_back_and_allows_a_retry() {
+        let mut session = AgentSession::default();
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![ToolCall {
+                id: "call".into(),
+                name: "add".into(),
+                input: "{}".into(),
+            }]),
+            ModelDecision::FinalAnswer("retried".into()),
+        ]);
+        let mut tools = FailingToolExecutor { calls: Vec::new() };
+        let error = session
+            .run_turn(&mut model, "first".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("execution failed"));
+        assert!(session.can_continue());
+        assert_eq!(session.full_history, Vec::<AgentMessage>::new());
+
+        let result = session
+            .run_turn(&mut model, "second".into(), None, None, &mut tools, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(result.answer, "retried");
+        assert_eq!(
+            model.received_messages[1],
+            vec![AgentMessage::User("second".into())]
+        );
+    }
+
+    #[test]
+    fn invariant_failures_close_the_session() {
+        let mut state = AgentState::new("hello".into(), None, None).unwrap();
+        state.iteration = usize::MAX;
+        let error = state.begin_iteration().unwrap_err();
+        assert!(error.is::<SessionInvariant>());
+        assert!(error.to_string().contains("iteration count overflow"));
+
+        let mut session = AgentSession {
+            pending_turn: Some(TurnCheckpoint {
+                full_history_len: 0,
+                working_context: None,
+            }),
+            closed: true,
+            ..AgentSession::default()
+        };
+        let error = session.fail_turn(invariant(anyhow::anyhow!("broken invariant")));
+        assert!(error.is::<SessionInvariant>());
         assert!(!session.can_continue());
         assert!(session.completed_messages().is_err());
+    }
+
+    #[test]
+    fn abort_turn_restores_a_dropped_turn_and_is_idempotent() {
+        let original = vec![
+            AgentMessage::User("first".into()),
+            AgentMessage::Assistant("answer".into()),
+        ];
+        let mut session = AgentSession::from_history(original.clone()).unwrap();
+        session.pending_turn = Some(TurnCheckpoint {
+            full_history_len: original.len(),
+            working_context: Some(original.clone()),
+        });
+        session
+            .full_history
+            .push(AgentMessage::User("partial".into()));
+        session.working_context = None;
+        session.closed = true;
+
+        session.abort_turn();
+        assert_eq!(session.full_history, original);
+        assert_eq!(
+            session.working_context.as_deref(),
+            Some(original.as_slice())
+        );
+        assert!(session.can_continue());
+
+        session.abort_turn();
+        assert_eq!(session.full_history, original);
+        assert_eq!(
+            session.working_context.as_deref(),
+            Some(original.as_slice())
+        );
     }
 
     struct FakeToolExecutor {
@@ -862,6 +1114,35 @@ mod tests {
         async fn execute(&mut self, name: &str, input: &str) -> Result<ToolOutput> {
             self.calls.push((name.to_string(), input.to_string()));
             Ok(self.output.clone())
+        }
+    }
+
+    enum ScriptedStep {
+        Decide(ModelDecision),
+        Fail,
+    }
+
+    struct ScriptedModel {
+        steps: VecDeque<ScriptedStep>,
+        received_messages: Vec<Vec<AgentMessage>>,
+    }
+
+    impl ScriptedModel {
+        fn new(steps: Vec<ScriptedStep>) -> Self {
+            Self {
+                steps: steps.into(),
+                received_messages: Vec::new(),
+            }
+        }
+    }
+
+    impl AgentModel for ScriptedModel {
+        async fn next_decision(&mut self, messages: &[AgentMessage]) -> Result<ModelDecision> {
+            self.received_messages.push(messages.to_vec());
+            match self.steps.pop_front() {
+                Some(ScriptedStep::Decide(decision)) => Ok(decision),
+                Some(ScriptedStep::Fail) | None => bail!("model unavailable"),
+            }
         }
     }
 
@@ -1294,10 +1575,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_rejects_reuse_after_failed_turn() {
+    async fn empty_tool_call_list_rolls_back_and_allows_retry() {
         let mut session = AgentSession::default();
         assert!(session.completed_messages().is_err());
-        let mut model = FakeModel::new(vec![ModelDecision::ToolCalls(vec![])]);
+        let mut model = FakeModel::new(vec![
+            ModelDecision::ToolCalls(vec![]),
+            ModelDecision::FinalAnswer("recovered".into()),
+        ]);
         let mut tool = FakeToolExecutor {
             output: ToolOutput::success("unused".into()),
             calls: Vec::new(),
@@ -1308,13 +1592,19 @@ mod tests {
                 .await
                 .is_err()
         );
-        let error = session
+        assert!(session.can_continue());
+        assert_eq!(session.full_history, Vec::<AgentMessage>::new());
+
+        let result = session
             .run_turn(&mut model, "retry".into(), None, None, &mut tool, |_| {})
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("session is closed"));
-        assert_eq!(model.received_messages.len(), 1);
-        assert!(session.completed_messages().is_err());
+            .unwrap();
+        assert_eq!(result.answer, "recovered");
+        assert_eq!(
+            model.received_messages[1],
+            vec![AgentMessage::User("retry".into())]
+        );
+        assert_eq!(session.completed_messages().unwrap().len(), 2);
     }
 
     #[tokio::test]
